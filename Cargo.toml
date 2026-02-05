@@ -36,7 +36,6 @@ std = ["alloc"]
 # Enable memory mapping support for zero-copy parsing.
 # Depends on the `std` feature.
 memmap = ["std", "dep:memmap2"]
-
 # Enable multithreaded parsing.
 # Depends on the `std` feature.
 #
