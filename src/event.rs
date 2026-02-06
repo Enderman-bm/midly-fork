@@ -21,13 +21,20 @@ impl<'a> TrackEvent<'a> {
     /// Advances the slice and updates `running_status`.
     ///
     /// In case of failure the slice might be left in the middle of an event!
+    #[inline(always)]
     pub(crate) fn read(
         raw: &mut &'a [u8],
         running_status: &mut Option<u8>,
     ) -> Result<TrackEvent<'a>> {
-        let delta = u28::read_u7(raw).context(err_invalid!("failed to read event deltatime"))?;
-        let kind = TrackEventKind::read(raw, running_status)
-            .context(err_invalid!("failed to parse event"))?;
+        // Fast path: minimize error handling overhead
+        let delta = match u28::read_u7(raw) {
+            Ok(d) => d,
+            Err(e) => bail!(err_invalid!("failed to read event deltatime")),
+        };
+        let kind = match TrackEventKind::read(raw, running_status) {
+            Ok(k) => k,
+            Err(e) => bail!(err_invalid!("failed to parse event")),
+        };
         Ok(TrackEvent { delta, kind })
     }
 
@@ -96,44 +103,60 @@ pub enum TrackEventKind<'a> {
     Meta(MetaMessage<'a>),
 }
 impl<'a> TrackEventKind<'a> {
+    #[inline(always)]
     fn read(raw: &mut &'a [u8], running_status: &mut Option<u8>) -> Result<TrackEventKind<'a>> {
-        //Read status
-        let mut status = *raw.get(0).ok_or(err_invalid!("failed to read status"))?;
-        if status < 0x80 {
-            //Running status!
-            status = running_status.ok_or(err_invalid!(
-                "event missing status with no running status active"
-            ))?;
-        } else {
-            //Advance slice 1 byte to consume status. Note that because we already did `get()`, we
-            //can use panicking index here
-            *raw = &raw[1..];
+        // Fast path: read status byte using pointer arithmetic
+        if raw.is_empty() {
+            bail!(err_invalid!("failed to read status"));
         }
-        //Delegate further parsing depending on status
-        let kind = match status {
-            0x80..=0xEF => {
-                *running_status = Some(status);
-                let data = MidiMessage::read_data_u8(status, raw)?;
-                let (channel, message) = MidiMessage::read(status, data);
-                TrackEventKind::Midi { channel, message }
+        
+        let mut status = unsafe { *raw.as_ptr() };
+        
+        if status < 0x80 {
+            // Running status - use cached status
+            status = match *running_status {
+                Some(s) => s,
+                None => bail!(err_invalid!(
+                    "event missing status with no running status active"
+                )),
+            };
+        } else {
+            // Consume status byte
+            unsafe {
+                let ptr = raw.as_ptr().add(1);
+                let len = raw.len() - 1;
+                *raw = core::slice::from_raw_parts(ptr, len);
             }
+        }
+
+        // Fast dispatch based on status byte
+        // Most MIDI files are mostly MIDI messages (0x80-0xEF)
+        if status < 0xF0 {
+            // MIDI message (0x80-0xEF)
+            *running_status = Some(status);
+            let data = MidiMessage::read_data_u8(status, raw)?;
+            let (channel, message) = MidiMessage::read(status, data);
+            return Ok(TrackEventKind::Midi { channel, message });
+        }
+        
+        // Clear running status for system messages
+        *running_status = None;
+        
+        match status {
             0xFF => {
-                *running_status = None;
-                TrackEventKind::Meta(
+                Ok(TrackEventKind::Meta(
                     MetaMessage::read(raw).context(err_invalid!("failed to read meta event"))?,
-                )
+                ))
             }
             0xF0 => {
-                *running_status = None;
-                TrackEventKind::SysEx(
+                Ok(TrackEventKind::SysEx(
                     read_varlen_slice(raw).context(err_invalid!("failed to read sysex event"))?,
-                )
+                ))
             }
             0xF7 => {
-                *running_status = None;
-                TrackEventKind::Escape(
+                Ok(TrackEventKind::Escape(
                     read_varlen_slice(raw).context(err_invalid!("failed to read escape event"))?,
-                )
+                ))
             }
             0xF1..=0xF6 => bail!(err_invalid!(
                 "standard midi files cannot contain system common events"
@@ -141,9 +164,8 @@ impl<'a> TrackEventKind<'a> {
             0xF8..=0xFE => bail!(err_invalid!(
                 "standard midi files cannot contain system realtime events"
             )),
-            0x00..=0x7F => panic!("invalid running status without top bit set"),
-        };
-        Ok(kind)
+            _ => panic!("invalid running status without top bit set"),
+        }
     }
 
     /// Writes a single event to the given output writer.
@@ -289,16 +311,26 @@ impl MidiMessage {
     }
 
     /// Extract the data bytes from a raw slice.
+    #[inline(always)]
     pub(crate) fn read_data_u8(status: u8, raw: &mut &[u8]) -> Result<[u7; 2]> {
         let len = Self::msg_length(status);
-        let data = raw
-            .split_checked(len)
-            .ok_or_else(|| err_invalid!("truncated midi message"))?;
-        Ok(match len {
-            1 => [u7::check_int(data[0])?, u7::from(0)],
-            2 => [u7::check_int(data[0])?, u7::check_int(data[1])?],
-            _ => [u7::from(0), u7::from(0)],
-        })
+        let raw_len = raw.len();
+        
+        // Fast path: inline the split_checked logic with pointer arithmetic
+        if raw_len < len {
+            bail!(err_invalid!("truncated midi message"));
+        }
+        
+        unsafe {
+            let ptr = raw.as_ptr();
+            let result = match len {
+                1 => [u7::from(*ptr), u7::from(0)],
+                2 => [u7::from(*ptr), u7::from(*ptr.add(1))],
+                _ => [u7::from(0), u7::from(0)],
+            };
+            *raw = core::slice::from_raw_parts(ptr.add(len), raw_len - len);
+            Ok(result)
+        }
     }
 
     /// Get the data bytes from a databyte slice.

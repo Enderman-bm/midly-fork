@@ -34,40 +34,65 @@ pub(crate) trait IntReadBottom7: Sized {
 
 /// Implement simple big endian integer reads.
 macro_rules! impl_read_int {
-    {$( $int:ty ),*} => {
-        $(
-            impl IntRead for $int {
-                #[inline]
-                fn read(raw: &mut &[u8]) -> StdResult<$int, &'static ErrorKind> {
-                    let bytes = raw.split_checked(mem::size_of::<$int>())
-                        .ok_or(err_invalid!("failed to read the expected integer"))?;
-                    Ok(bytes.iter().fold(0,|mut acc,byte| {
-                        acc=acc.checked_shl(8).unwrap_or(0);
-                        acc|=*byte as $int;
-                        acc
-                    }))
-                }
+    {u8} => {
+        impl IntRead for u8 {
+            #[inline]
+            fn read(raw: &mut &[u8]) -> StdResult<u8, &'static ErrorKind> {
+                let bytes = raw.split_checked(1)
+                    .ok_or(err_invalid!("failed to read the expected integer"))?;
+                Ok(bytes[0])
             }
-        )*
-    }
+        }
+    };
+    {u16} => {
+        impl IntRead for u16 {
+            #[inline]
+            fn read(raw: &mut &[u8]) -> StdResult<u16, &'static ErrorKind> {
+                let bytes = raw.split_checked(2)
+                    .ok_or(err_invalid!("failed to read the expected integer"))?;
+                Ok(((bytes[0] as u16) << 8) | (bytes[1] as u16))
+            }
+        }
+    };
+    {u32} => {
+        impl IntRead for u32 {
+            #[inline]
+            fn read(raw: &mut &[u8]) -> StdResult<u32, &'static ErrorKind> {
+                let bytes = raw.split_checked(4)
+                    .ok_or(err_invalid!("failed to read the expected integer"))?;
+                Ok(((bytes[0] as u32) << 24) | ((bytes[1] as u32) << 16) |
+                   ((bytes[2] as u32) << 8) | (bytes[3] as u32))
+            }
+        }
+    };
 }
-impl_read_int! {u8,u16,u32}
+impl_read_int! {u8}
+impl_read_int! {u16}
+impl_read_int! {u32}
 
 /// Slightly restricted integers.
 macro_rules! int_feature {
     { $name:ident ; $inner:tt : read_u7 } => {
         impl IntReadBottom7 for $name {
+            #[inline]
             fn read_u7(raw: &mut &[u8]) -> StdResult<$name, &'static ErrorKind> {
                 let bytes = raw.split_checked(mem::size_of::<$inner>())
                     .ok_or(err_invalid!("failed to read the expected integer"))?;
                 if cfg!(feature = "strict") {
                     ensure!(bytes.iter().all(|byte| bit_range!(*byte, 7..8)==0), err_malformed!("invalid byte with top bit set"));
                 }
-                let raw = bytes.iter().fold(0, |mut acc,byte| {
-                    acc <<= 7;
-                    acc |= bit_range!(*byte, 0..7) as $inner;
-                    acc
-                });
+                // Unroll the loop for better performance
+                let raw: $inner = match bytes.len() {
+                    1 => (bytes[0] & 0x7F) as $inner,
+                    2 => (((bytes[0] & 0x7F) as $inner) << 7) | ((bytes[1] & 0x7F) as $inner),
+                    _ => {
+                        let mut acc: $inner = 0;
+                        for byte in bytes.iter() {
+                            acc = (acc << 7) | ((*byte & 0x7F) as $inner);
+                        }
+                        acc
+                    }
+                };
                 Ok(if cfg!(feature = "strict") {
                     Self::try_from(raw).ok_or(err_malformed!(stringify!("expected " $name ", found " $inner)))?
                 }else{
@@ -383,32 +408,83 @@ restricted_int! {
     u28: u32 => 28;
 }
 impl IntReadBottom7 for u28 {
+    #[inline(always)]
     fn read_u7(raw: &mut &[u8]) -> StdResult<u28, &'static ErrorKind> {
-        let mut int: u32 = 0;
-        for _ in 0..4 {
-            let byte = match raw.split_checked(1) {
-                Some(slice) => slice[0],
-                None => {
-                    if cfg!(feature = "strict") {
-                        bail!(err_malformed!("unexpected eof while reading varlen int"))
-                    } else {
-                        //Stay with what was read
-                        break;
-                    }
-                }
-            };
-            int <<= 7;
-            int |= bit_range!(byte, 0..7) as u32;
-            if bit_range!(byte, 7..8) == 0 {
-                //Since we did at max 4 reads of 7 bits each, there MUST be at max 28 bits in this int
-                //Therefore it's safe to call lossy `from`
-                return Ok(u28::from(int));
+        // Fast path: most varlen ints are 1-2 bytes
+        let len = raw.len();
+        
+        if len == 0 {
+            if cfg!(feature = "strict") {
+                bail!(err_malformed!("unexpected eof while reading varlen int"))
+            } else {
+                return Ok(u28::from(0));
             }
         }
-        if cfg!(feature = "strict") {
-            Err(err_malformed!("varlen integer larger than 4 bytes"))
-        } else {
-            //Use the 4 bytes as-is
+        
+        // Use unsafe pointer arithmetic for maximum speed
+        unsafe {
+            let ptr = raw.as_ptr();
+            
+            // First byte
+            let b0 = *ptr;
+            let mut int = (b0 & 0x7F) as u32;
+            if b0 & 0x80 == 0 {
+                *raw = core::slice::from_raw_parts(ptr.add(1), len - 1);
+                return Ok(u28::from(int));
+            }
+            
+            if len < 2 {
+                if cfg!(feature = "strict") {
+                    bail!(err_malformed!("unexpected eof while reading varlen int"))
+                } else {
+                    *raw = &[];
+                    return Ok(u28::from(int));
+                }
+            }
+            
+            // Second byte
+            let b1 = *ptr.add(1);
+            int = (int << 7) | ((b1 & 0x7F) as u32);
+            if b1 & 0x80 == 0 {
+                *raw = core::slice::from_raw_parts(ptr.add(2), len - 2);
+                return Ok(u28::from(int));
+            }
+            
+            if len < 3 {
+                if cfg!(feature = "strict") {
+                    bail!(err_malformed!("unexpected eof while reading varlen int"))
+                } else {
+                    *raw = &[];
+                    return Ok(u28::from(int));
+                }
+            }
+            
+            // Third byte
+            let b2 = *ptr.add(2);
+            int = (int << 7) | ((b2 & 0x7F) as u32);
+            if b2 & 0x80 == 0 {
+                *raw = core::slice::from_raw_parts(ptr.add(3), len - 3);
+                return Ok(u28::from(int));
+            }
+            
+            if len < 4 {
+                if cfg!(feature = "strict") {
+                    bail!(err_malformed!("unexpected eof while reading varlen int"))
+                } else {
+                    *raw = &[];
+                    return Ok(u28::from(int));
+                }
+            }
+            
+            // Fourth byte
+            let b3 = *ptr.add(3);
+            int = (int << 7) | ((b3 & 0x7F) as u32);
+            *raw = core::slice::from_raw_parts(ptr.add(4), len - 4);
+            
+            if b3 & 0x80 != 0 && cfg!(feature = "strict") {
+                bail!(err_malformed!("varlen integer larger than 4 bytes"))
+            }
+            
             Ok(u28::from(int))
         }
     }
@@ -440,20 +516,22 @@ impl u28 {
 }
 
 /// Reads a slice represented in the input as a `u28` `len` followed by `len` bytes.
+#[inline]
 pub(crate) fn read_varlen_slice<'a>(raw: &mut &'a [u8]) -> Result<&'a [u8]> {
     let len = u28::read_u7(raw)
         .context(err_invalid!("failed to read varlen slice length"))?
-        .as_int();
-    Ok(match raw.split_checked(len as usize) {
-        Some(slice) => slice,
-        None => {
-            if cfg!(feature = "strict") {
-                bail!(err_malformed!("incomplete varlen slice"))
-            } else {
-                mem::replace(raw, &[])
-            }
-        }
-    })
+        .as_int() as usize;
+    
+    // Fast path: inline bounds check
+    if raw.len() >= len {
+        let slice = &raw[..len];
+        *raw = &raw[len..];
+        Ok(slice)
+    } else if cfg!(feature = "strict") {
+        bail!(err_malformed!("incomplete varlen slice"))
+    } else {
+        Ok(mem::replace(raw, &[]))
+    }
 }
 
 /// Write a slice represented as a varlen `u28` as its length and then the raw bytes.

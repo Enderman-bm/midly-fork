@@ -8,38 +8,9 @@ const MIDI_DIR: &str = "../test-asset";
 
 const MIDI_EXT: &[&str] = &["mid", "midi", "rmi"];
 
-const PARSERS: &[(&str, fn(&Path) -> Result<usize, String>)] = &[
-    (&"midly", parse_midly),
-    (&"nom-midi", parse_nom),
-    (&"rimd", parse_rimd),
-    (&"augmented-midi", parse_augmented_midi),
-];
-
-fn parse_midly(path: &Path) -> Result<usize, String> {
-    let data = fs::read(path).map_err(|err| format!("{}", err))?;
-    let smf = midly::Smf::parse(&data).map_err(|err| format!("{}", err))?;
+fn parse_midly(data: &[u8]) -> Result<usize, String> {
+    let smf = midly::Smf::parse(data).map_err(|err| format!("{}", err))?;
     Ok(smf.tracks.len())
-}
-
-fn parse_nom(path: &Path) -> Result<usize, String> {
-    let data = fs::read(path).map_err(|err| format!("{}", err))?;
-    let smf = nom_midi::parser::parse_smf(&data)
-        .map_err(|err| format!("{}", err))?
-        .1;
-    Ok(smf.tracks.len())
-}
-
-fn parse_rimd(path: &Path) -> Result<usize, String> {
-    let smf = rimd::SMF::from_file(path).map_err(|err| format!("{}", err))?;
-    Ok(smf.tracks.len())
-}
-
-fn parse_augmented_midi(path: &Path) -> Result<usize, String> {
-    let data = fs::read(path).map_err(|err| format!("{}", err))?;
-    let smf: augmented_midi::MIDIFile<&str, &[u8]> = augmented_midi::parse_midi_file(&data)
-        .map_err(|err| format!("{}", err))?
-        .1;
-    Ok(smf.chunks.len())
 }
 
 fn list_midis(dir: &Path) -> Vec<PathBuf> {
@@ -56,12 +27,12 @@ fn list_midis(dir: &Path) -> Vec<PathBuf> {
     midis
 }
 
-fn use_parser(parse: fn(&Path) -> Result<usize, String>, path: &Path) -> Result<(), String> {
+fn use_parser(parse: fn(&[u8]) -> Result<usize, String>, data: &[u8]) -> Result<(), String> {
     let round = |num: f64| (num * 100.0).round() / 100.0;
 
     let runtime = || -> Result<_, String> {
         let start = Instant::now();
-        let out = parse(path)?;
+        let out = parse(data)?;
         let time = round((start.elapsed().as_micros() as f64) / 1000.0);
         Ok((out, time))
     };
@@ -98,23 +69,7 @@ fn use_parser(parse: fn(&Path) -> Result<usize, String>, path: &Path) -> Result<
 
 fn main() {
     let midi_filter = env::args().nth(1).unwrap_or_default().to_lowercase();
-    let parser_filter = env::args().nth(2).unwrap_or_default().to_lowercase();
-    let midi_dir = env::args().nth(3).unwrap_or(MIDI_DIR.to_string());
-
-    let parsers = PARSERS
-        .iter()
-        .filter(|(name, _)| name.contains(&parser_filter))
-        .collect::<Vec<_>>();
-    if parsers.is_empty() {
-        eprintln!("no parsers match the pattern \"{}\"", parser_filter);
-        eprint!("available parsers: ");
-        for (i, (name, _)) in PARSERS.iter().enumerate() {
-            if i > 0 {
-                eprint!(", ");
-            }
-            eprint!("{}", name);
-        }
-    }
+    let midi_dir = env::args().nth(2).unwrap_or(MIDI_DIR.to_string());
 
     let unfiltered_midis = list_midis(midi_dir.as_ref());
     let midis = unfiltered_midis
@@ -136,17 +91,15 @@ fn main() {
         }
     } else {
         for midi in midis {
-            //Read file to warm up file cache
-            let size = std::fs::read(midi).map(|b| b.len()).unwrap_or(0);
-            //Parse this file
+            //Read file once and reuse for all iterations
+            let data = fs::read(midi).map_err(|err| format!("{}", err)).unwrap();
+            let size = data.len();
             eprintln!("parsing file \"{}\" ({} KB)", midi.display(), size / 1024);
-            for &(name, parse) in parsers.iter() {
-                eprint!("  {}: ", name);
-                match use_parser(*parse, &midi) {
-                    Ok(()) => {}
-                    Err(_err) => {
-                        eprintln!("parse error");
-                    }
+            eprint!("  midly: ");
+            match use_parser(parse_midly, &data) {
+                Ok(()) => {}
+                Err(_err) => {
+                    eprintln!("parse error");
                 }
             }
             eprintln!();

@@ -112,32 +112,59 @@ impl<'a, W: Write> Write for &'a mut W {
 impl Write for Vec<u8> {
     type Error = &'static str;
     type Seekable = Self;
+
     #[inline]
     fn write(&mut self, buf: &[u8]) -> WriteResult<Self> {
-        self.extend_from_slice(buf);
+        // Use reserve + extend for better performance on large writes
+        self.reserve(buf.len());
+        // SAFETY: We just reserved enough space
+        unsafe {
+            let len = self.len();
+            let cap = self.capacity();
+            debug_assert!(len + buf.len() <= cap);
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                self.as_mut_ptr().add(len),
+                buf.len()
+            );
+            self.set_len(len + buf.len());
+        }
         Ok(())
     }
+
     #[inline]
     fn invalid_input(msg: &'static str) -> &'static str {
         msg
     }
+
     #[inline]
     fn make_seekable(&mut self) -> Option<&mut Self> {
         Some(self)
     }
 }
+
 #[cfg(feature = "alloc")]
 impl Seek for Vec<u8> {
     #[inline]
     fn tell(&mut self) -> StdResult<u64, Self::Error> {
         Ok(self.len() as u64)
     }
+
     #[inline]
     fn write_at(&mut self, buf: &[u8], pos: u64) -> WriteResult<Self> {
-        let out = self
-            .get_mut(pos as usize..pos as usize + buf.len())
-            .ok_or("invalid seekback")?;
-        out.copy_from_slice(buf);
+        let pos = pos as usize;
+        let end = pos + buf.len();
+        if end > self.len() {
+            return Err("invalid seekback");
+        }
+        // SAFETY: We just checked the bounds
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                self.as_mut_ptr().add(pos),
+                buf.len()
+            );
+        }
         Ok(())
     }
 }

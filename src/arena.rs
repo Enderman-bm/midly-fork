@@ -45,6 +45,7 @@ struct Chunk {
 }
 
 impl Chunk {
+    #[inline]
     fn new(size: usize) -> Self {
         Self {
             data: vec![0u8; size].into_boxed_slice(),
@@ -52,19 +53,23 @@ impl Chunk {
         }
     }
 
+    #[inline]
     fn remaining(&self) -> usize {
         self.data.len() - self.used
     }
 
+    #[inline]
     fn can_fit(&self, size: usize) -> bool {
         self.remaining() >= size
     }
 
+    #[inline]
     fn allocate(&mut self, size: usize) -> &mut [u8] {
         debug_assert!(self.can_fit(size));
         let start = self.used;
         self.used += size;
-        &mut self.data[start..self.used]
+        // SAFETY: We just checked that we have enough space
+        unsafe { core::slice::from_raw_parts_mut(self.data.as_mut_ptr().add(start), size) }
     }
 }
 
@@ -141,12 +146,12 @@ impl Arena {
     /// is full, a new chunk is allocated which is O(chunk_size).
     #[inline]
     pub fn add<'a, 'b>(&'a self, bytes: &'b [u8]) -> &'a mut [u8] {
+        let size = bytes.len();
+
         // Fast path for empty slices
-        if bytes.is_empty() {
+        if size == 0 {
             return &mut [];
         }
-
-        let size = bytes.len();
 
         // Large allocations get their own chunk to avoid wasting space
         if size > LARGE_ALLOC_THRESHOLD {
@@ -155,17 +160,20 @@ impl Arena {
 
         // SAFETY: We have &self, and we only modify through UnsafeCell
         unsafe {
-            let current = &mut *self.current.get();
+            // Check if we need a new chunk and grow if necessary
+            let needs_grow = (*self.current.get())
+                .as_ref()
+                .map_or(true, |c| !c.can_fit(size));
 
-            // Check if we need a new chunk
-            if current.as_ref().map_or(true, |c| !c.can_fit(size)) {
+            if needs_grow {
                 self.grow();
             }
 
-            // Now allocate from current chunk
-            let chunk = current.as_mut().unwrap();
+            // Now allocate from current chunk (must re-fetch after grow)
+            let chunk = (*self.current.get()).as_mut().unwrap();
             let dest = chunk.allocate(size);
-            dest.copy_from_slice(bytes);
+            // Use ptr::copy_nonoverlapping for potentially faster copy
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest.as_mut_ptr(), size);
             *self.total_allocated.get() += size;
             dest
         }
@@ -215,15 +223,21 @@ impl Arena {
     fn grow(&self) {
         unsafe {
             // Move current chunk to the full list
-            if let Some(current) = (*self.current.get()).take() {
+            let prev_size = if let Some(current) = (*self.current.get()).take() {
+                let size = current.data.len();
                 (*self.chunks.get()).push(current);
-            }
+                size
+            } else {
+                0
+            };
 
             // Calculate new chunk size (double each time, capped at 1MB)
-            let new_size = (*self.chunks.get())
-                .last()
-                .map(|c| (c.data.len() * 2).min(1024 * 1024))
-                .unwrap_or(DEFAULT_CHUNK_SIZE);
+            // Only double if previous chunk was reasonably large, otherwise use default
+            let new_size = if prev_size >= DEFAULT_CHUNK_SIZE / 2 {
+                (prev_size * 2).min(1024 * 1024)
+            } else {
+                DEFAULT_CHUNK_SIZE
+            };
 
             *self.current.get() = Some(Box::new(Chunk::new(new_size)));
         }
@@ -233,24 +247,25 @@ impl Arena {
     #[cold]
     fn add_large<'a, 'b>(&'a self, bytes: &'b [u8]) -> &'a mut [u8] {
         unsafe {
+            let size = bytes.len();
             // Create a perfectly-sized chunk for this allocation
-            let mut new_chunk = Box::new(Chunk::new(bytes.len()));
-            let dest = new_chunk.allocate(bytes.len());
-            dest.copy_from_slice(bytes);
-            
+            let mut new_chunk = Box::new(Chunk::new(size));
+            let dest = new_chunk.allocate(size);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest.as_mut_ptr(), size);
+
             // Move current chunk to full list and use the new one
             if let Some(current) = (*self.current.get()).take() {
                 (*self.chunks.get()).push(current);
             }
             *self.current.get() = Some(new_chunk);
-            *self.total_allocated.get() += bytes.len();
-            
+            *self.total_allocated.get() += size;
+
             // We need to return a reference with lifetime 'a
             // The data is now stored in self.current, so this is valid
             let current = &mut *self.current.get();
             let chunk = current.as_mut().unwrap();
-            let start = chunk.used - bytes.len();
-            &mut chunk.data[start..chunk.used]
+            let start = chunk.used - size;
+            core::slice::from_raw_parts_mut(chunk.data.as_mut_ptr().add(start), size)
         }
     }
 }

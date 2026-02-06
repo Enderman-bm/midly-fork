@@ -42,7 +42,7 @@ const EVENTS_TO_BYTES: f32 = 3.4;
 ///
 /// When writing, the MIDI body size is estimated from the event count using `BYTES_PER_EVENT`.
 #[cfg(feature = "parallel")]
-const PARALLEL_ENABLE_THRESHOLD: usize = 3 * 1024;
+const PARALLEL_ENABLE_THRESHOLD: usize = 1024; // Lower threshold for earlier parallelization
 
 /// A single track: simply a list of track events.
 ///
@@ -308,47 +308,54 @@ where
     E::IntoIter: Clone + Send,
     W: Write,
 {
-    let tracks = tracks.into_iter().map(|events| events.into_iter());
+    let tracks_iter = tracks.into_iter().map(|events| events.into_iter());
     //Write the header first
-    Chunk::write_header(header, tracks.len(), out)?;
+    Chunk::write_header(header, tracks_iter.len(), out)?;
 
     //Try to write the file in parallel
     #[cfg(feature = "parallel")]
     {
         //Figure out whether multithreading is worth it
-        let event_count = tracks
-            .clone()
-            .map(|track| track.into_iter().size_hint().0)
-            .sum::<usize>();
+        let tracks_vec: Vec<_> = tracks_iter.collect();
+        let event_count: usize = tracks_vec
+            .iter()
+            .map(|track| track.size_hint().0)
+            .sum();
         if (event_count as f32 * EVENTS_TO_BYTES) > PARALLEL_ENABLE_THRESHOLD as f32 {
             use rayon::prelude::*;
 
-            //Write out the tracks in parallel into several different buffers
-            let mut track_chunks = Vec::new();
-            tracks
-                .collect::<Vec<_>>()
+            // Pre-allocate with exact capacity to avoid reallocations
+            let mut track_chunks: Vec<StdResult<Vec<u8>, &'static str>> = Vec::with_capacity(tracks_vec.len());
+            tracks_vec
                 .into_par_iter()
                 .map(|track| {
                     let mut track_chunk = Vec::new();
                     Chunk::write_to_vec(track, &mut track_chunk)?;
-                    Ok(track_chunk)
+                    StdResult::<_, &'static str>::Ok(track_chunk)
                 })
                 .collect_into_vec(&mut track_chunks);
 
             //Write down the tracks sequentially and in order
             for result in track_chunks {
-                let track_chunk = result.map_err(W::invalid_input)?;
+                let track_chunk = result.map_err(|msg| W::invalid_input(msg))?;
                 out.write(&track_chunk)?;
             }
             return Ok(());
         }
+        // Fall through to single-threaded path with the collected tracks
+        let mut buf = Vec::new();
+        for track in tracks_vec {
+            Chunk::write_to_vec(track, &mut buf).map_err(|msg| W::invalid_input(msg))?;
+            out.write(&buf)?;
+        }
+        return Ok(());
     }
 
     #[cfg(feature = "alloc")]
     {
         //Write the tracks into a buffer before writing out to the file
         let mut buf = Vec::new();
-        for track in tracks {
+        for track in tracks_iter {
             Chunk::write_to_vec(track, &mut buf).map_err(|msg| W::invalid_input(msg))?;
             out.write(&buf)?;
         }
@@ -359,7 +366,7 @@ where
     {
         if let Some(out) = out.make_seekable() {
             //Write down using seeks if the writer is seekable
-            for track in tracks {
+            for track in tracks_iter {
                 Chunk::write_seek(track, out)?;
             }
             return Ok(());
@@ -368,7 +375,7 @@ where
         //Last resort: do probe-writing.
         //Two passes are done: one to find out the size of the chunk and another to actually
         //write the chunk.
-        for track in tracks {
+        for track in tracks_iter {
             Chunk::write_probe(track, out)?;
         }
         Ok(())
@@ -652,7 +659,9 @@ impl<'a> TrackIter<'a> {
         //Attempt to use multiple threads if possible and advantageous
         #[cfg(feature = "parallel")]
         {
-            if self.unread().len() >= PARALLEL_ENABLE_THRESHOLD {
+            let unread_len = self.unread().len();
+            // Use parallel parsing for large files (>1MB) or many tracks
+            if unread_len >= PARALLEL_ENABLE_THRESHOLD {
                 use rayon::prelude::*;
 
                 let chunk_vec = self.collect::<Result<Vec<_>>>()?;
@@ -751,23 +760,38 @@ impl<'a, T: EventKind<'a>> EventIterGeneric<'a, T> {
     #[cfg(feature = "alloc")]
     #[inline]
     fn estimate_events(&self) -> usize {
-        (self.raw.len() as f32 * BYTES_TO_EVENTS) as usize
+        // More aggressive estimation for large files
+        let bytes = self.raw.len();
+        if bytes > 1024 * 1024 {
+            // For large files, assume ~3 bytes per event (typical for dense MIDI)
+            bytes / 3
+        } else {
+            (bytes as f32 * BYTES_TO_EVENTS) as usize
+        }
     }
 
     #[cfg(feature = "alloc")]
     #[inline]
     fn into_vec(mut self) -> Result<Vec<T::Event>> {
         let mut events = Vec::with_capacity(self.estimate_events());
-        while !self.raw.is_empty() {
-            match T::read_ev(&mut self.raw, &mut self.running_status) {
-                Ok(ev) => events.push(ev),
-                Err(err) => {
-                    self.raw = &[];
-                    if cfg!(feature = "strict") {
-                        Err(err).context(err_malformed!("malformed event"))?;
-                    } else {
-                        //Stop reading track silently on failure
+        // Use a fast path for the common case of no errors
+        if cfg!(not(feature = "strict")) {
+            while !self.raw.is_empty() {
+                match T::read_ev(&mut self.raw, &mut self.running_status) {
+                    Ok(ev) => events.push(ev),
+                    Err(_) => {
+                        // In non-strict mode, stop reading on error
                         break;
+                    }
+                }
+            }
+        } else {
+            while !self.raw.is_empty() {
+                match T::read_ev(&mut self.raw, &mut self.running_status) {
+                    Ok(ev) => events.push(ev),
+                    Err(err) => {
+                        self.raw = &[];
+                        Err(err).context(err_malformed!("malformed event"))?;
                     }
                 }
             }

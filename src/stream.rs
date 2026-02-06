@@ -110,9 +110,13 @@ impl<B: Buffer> MidiStream<B> {
     ///
     /// Note that some calls to `feed` might produce no events, and others may produce as many as
     /// the amount of bytes fed in.
+    #[inline]
     pub fn feed(&mut self, bytes: &[u8], mut handle_ev: impl FnMut(LiveEvent)) {
-        for &byte in bytes {
-            self.feed_byte(byte, &mut handle_ev);
+        // Process bytes in chunks for better cache locality
+        let mut i = 0;
+        while i < bytes.len() {
+            self.feed_byte(bytes[i], &mut handle_ev);
+            i += 1;
         }
     }
 
