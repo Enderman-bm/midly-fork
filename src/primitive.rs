@@ -412,7 +412,7 @@ impl IntReadBottom7 for u28 {
     fn read_u7(raw: &mut &[u8]) -> StdResult<u28, &'static ErrorKind> {
         // Fast path: most varlen ints are 1-2 bytes
         let len = raw.len();
-        
+
         if len == 0 {
             if cfg!(feature = "strict") {
                 bail!(err_malformed!("unexpected eof while reading varlen int"))
@@ -420,11 +420,11 @@ impl IntReadBottom7 for u28 {
                 return Ok(u28::from(0));
             }
         }
-        
+
         // Use unsafe pointer arithmetic for maximum speed
         unsafe {
             let ptr = raw.as_ptr();
-            
+
             // First byte
             let b0 = *ptr;
             let mut int = (b0 & 0x7F) as u32;
@@ -432,7 +432,7 @@ impl IntReadBottom7 for u28 {
                 *raw = core::slice::from_raw_parts(ptr.add(1), len - 1);
                 return Ok(u28::from(int));
             }
-            
+
             if len < 2 {
                 if cfg!(feature = "strict") {
                     bail!(err_malformed!("unexpected eof while reading varlen int"))
@@ -441,7 +441,7 @@ impl IntReadBottom7 for u28 {
                     return Ok(u28::from(int));
                 }
             }
-            
+
             // Second byte
             let b1 = *ptr.add(1);
             int = (int << 7) | ((b1 & 0x7F) as u32);
@@ -449,7 +449,7 @@ impl IntReadBottom7 for u28 {
                 *raw = core::slice::from_raw_parts(ptr.add(2), len - 2);
                 return Ok(u28::from(int));
             }
-            
+
             if len < 3 {
                 if cfg!(feature = "strict") {
                     bail!(err_malformed!("unexpected eof while reading varlen int"))
@@ -458,7 +458,7 @@ impl IntReadBottom7 for u28 {
                     return Ok(u28::from(int));
                 }
             }
-            
+
             // Third byte
             let b2 = *ptr.add(2);
             int = (int << 7) | ((b2 & 0x7F) as u32);
@@ -466,7 +466,7 @@ impl IntReadBottom7 for u28 {
                 *raw = core::slice::from_raw_parts(ptr.add(3), len - 3);
                 return Ok(u28::from(int));
             }
-            
+
             if len < 4 {
                 if cfg!(feature = "strict") {
                     bail!(err_malformed!("unexpected eof while reading varlen int"))
@@ -475,16 +475,16 @@ impl IntReadBottom7 for u28 {
                     return Ok(u28::from(int));
                 }
             }
-            
+
             // Fourth byte
             let b3 = *ptr.add(3);
             int = (int << 7) | ((b3 & 0x7F) as u32);
             *raw = core::slice::from_raw_parts(ptr.add(4), len - 4);
-            
+
             if b3 & 0x80 != 0 && cfg!(feature = "strict") {
                 bail!(err_malformed!("varlen integer larger than 4 bytes"))
             }
-            
+
             Ok(u28::from(int))
         }
     }
@@ -521,7 +521,7 @@ pub(crate) fn read_varlen_slice<'a>(raw: &mut &'a [u8]) -> Result<&'a [u8]> {
     let len = u28::read_u7(raw)
         .context(err_invalid!("failed to read varlen slice length"))?
         .as_int() as usize;
-    
+
     // Fast path: inline bounds check
     if raw.len() >= len {
         let slice = &raw[..len];

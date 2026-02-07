@@ -273,7 +273,15 @@ pub fn parse(raw: &[u8]) -> Result<(Header, TrackIter)> {
         },
         None => Err(err_invalid!("no midi header chunk")),
     }?;
-    let tracks = chunks.as_tracks(track_count);
+    // Cap track count hint to avoid huge allocations from malformed headers
+    let max_tracks_possible = chunks.raw.len() / 8;
+    if cfg!(feature = "strict") && (track_count as usize) > max_tracks_possible {
+        bail!(err_malformed!(
+            "declared track count exceeds available data"
+        ));
+    }
+    let track_count_hint = track_count.min(max_tracks_possible as u16);
+    let tracks = chunks.as_tracks(track_count_hint);
     Ok((header, tracks))
 }
 
@@ -317,15 +325,13 @@ where
     {
         //Figure out whether multithreading is worth it
         let tracks_vec: Vec<_> = tracks_iter.collect();
-        let event_count: usize = tracks_vec
-            .iter()
-            .map(|track| track.size_hint().0)
-            .sum();
+        let event_count: usize = tracks_vec.iter().map(|track| track.size_hint().0).sum();
         if (event_count as f32 * EVENTS_TO_BYTES) > PARALLEL_ENABLE_THRESHOLD as f32 {
             use rayon::prelude::*;
 
             // Pre-allocate with exact capacity to avoid reallocations
-            let mut track_chunks: Vec<StdResult<Vec<u8>, &'static str>> = Vec::with_capacity(tracks_vec.len());
+            let mut track_chunks: Vec<StdResult<Vec<u8>, &'static str>> =
+                Vec::with_capacity(tracks_vec.len());
             tracks_vec
                 .into_par_iter()
                 .map(|track| {
@@ -351,7 +357,7 @@ where
         return Ok(());
     }
 
-    #[cfg(feature = "alloc")]
+    #[cfg(all(feature = "alloc", not(feature = "parallel")))]
     {
         //Write the tracks into a buffer before writing out to the file
         let mut buf = Vec::new();

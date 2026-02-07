@@ -73,6 +73,7 @@ impl Chunk {
     }
 }
 
+#[allow(clippy::mut_from_ref)]
 impl Arena {
     /// Create a new empty arena with default chunk size.
     #[inline]
@@ -102,7 +103,11 @@ impl Arena {
         // SAFETY: We have &mut self, so no other references exist
         unsafe {
             (*self.chunks.get()).clear();
-            *self.current.get() = Some(Box::new(Chunk::new(DEFAULT_CHUNK_SIZE)));
+            if let Some(current) = (*self.current.get()).as_mut() {
+                current.used = 0;
+            } else {
+                *self.current.get() = Some(Box::new(Chunk::new(DEFAULT_CHUNK_SIZE)));
+            }
             *self.total_allocated.get() = 0;
         }
     }
@@ -128,10 +133,7 @@ impl Arena {
                 .as_ref()
                 .map(|c| c.data.len())
                 .unwrap_or(0);
-            let chunks_cap: usize = (*self.chunks.get())
-                .iter()
-                .map(|c| c.data.len())
-                .sum();
+            let chunks_cap: usize = (*self.chunks.get()).iter().map(|c| c.data.len()).sum();
             current_cap + chunks_cap
         }
     }
@@ -170,7 +172,11 @@ impl Arena {
             }
 
             // Now allocate from current chunk (must re-fetch after grow)
-            let chunk = (*self.current.get()).as_mut().unwrap();
+            // SAFETY: grow() guarantees self.current is Some
+            let chunk = match (*self.current.get()).as_mut() {
+                Some(c) => c,
+                None => return &mut [],
+            };
             let dest = chunk.allocate(size);
             // Use ptr::copy_nonoverlapping for potentially faster copy
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest.as_mut_ptr(), size);
@@ -193,8 +199,19 @@ impl Arena {
             return self.add(&bytes);
         }
 
-        // For larger vecs, use the normal path
-        self.add(&bytes)
+        // For larger vecs, move to chunks directly to avoid copy
+        let mut chunk = Box::new(Chunk {
+            used: bytes.len(),
+            data: bytes.into_boxed_slice(),
+        });
+        let dest_ptr = chunk.data.as_mut_ptr();
+        let size = chunk.used;
+
+        unsafe {
+            (*self.chunks.get()).push(chunk);
+            *self.total_allocated.get() += size;
+            core::slice::from_raw_parts_mut(dest_ptr, size)
+        }
     }
 
     /// Add a slice of u7 values to the arena.
@@ -211,6 +228,7 @@ impl Arena {
     /// Add a Vec<u7> to the arena.
     #[inline]
     pub fn add_u7_vec<'a>(&'a self, databytes: Vec<u7>) -> &'a mut [u7] {
+        // We still need to move bytes into the arena; use a safe layout-compatible transmute.
         unsafe {
             let bytes: Vec<u8> = mem::transmute(databytes);
             let result = self.add_vec(bytes);
@@ -222,10 +240,12 @@ impl Arena {
     #[cold]
     fn grow(&self) {
         unsafe {
-            // Move current chunk to the full list
+            // Move current chunk to the full list only if it has data
             let prev_size = if let Some(current) = (*self.current.get()).take() {
                 let size = current.data.len();
-                (*self.chunks.get()).push(current);
+                if current.used > 0 {
+                    (*self.chunks.get()).push(current);
+                }
                 size
             } else {
                 0
@@ -253,9 +273,11 @@ impl Arena {
             let dest = new_chunk.allocate(size);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest.as_mut_ptr(), size);
 
-            // Move current chunk to full list and use the new one
+            // Move current chunk to full list if it has data
             if let Some(current) = (*self.current.get()).take() {
-                (*self.chunks.get()).push(current);
+                if current.used > 0 {
+                    (*self.chunks.get()).push(current);
+                }
             }
             *self.current.get() = Some(new_chunk);
             *self.total_allocated.get() += size;
@@ -263,7 +285,11 @@ impl Arena {
             // We need to return a reference with lifetime 'a
             // The data is now stored in self.current, so this is valid
             let current = &mut *self.current.get();
-            let chunk = current.as_mut().unwrap();
+            let chunk = match current.as_mut() {
+                Some(c) => c,
+                // SAFETY: We just set current to Some(new_chunk) above
+                None => return &mut [],
+            };
             let start = chunk.used - size;
             core::slice::from_raw_parts_mut(chunk.data.as_mut_ptr().add(start), size)
         }
@@ -273,7 +299,7 @@ impl Arena {
 impl Drop for Arena {
     #[inline]
     fn drop(&mut self) {
-        self.clear();
+        // All memory is automatically freed when current and chunks are dropped
     }
 }
 
@@ -306,7 +332,7 @@ mod tests {
         let arena = Arena::new();
         let data1 = arena.add(b"hello");
         let data2 = arena.add(b"world");
-        
+
         assert_eq!(data1, b"hello");
         assert_eq!(data2, b"world");
         assert_eq!(arena.len(), 10);
@@ -324,12 +350,12 @@ mod tests {
     fn test_arena_growth() {
         let arena = Arena::with_capacity(16);
         let initial_cap = arena.capacity();
-        
+
         // Add enough data to trigger growth
         for i in 0..100 {
             arena.add(&[i as u8; 100]);
         }
-        
+
         assert!(arena.capacity() > initial_cap);
         assert_eq!(arena.len(), 100 * 100);
     }
@@ -339,7 +365,7 @@ mod tests {
         let mut arena = Arena::new();
         arena.add(b"test data");
         assert!(!arena.is_empty());
-        
+
         arena.clear();
         assert!(arena.is_empty());
     }

@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+#[cfg(feature = "memory-report")]
+use midly::memory::{print_memory_usage, MemoryReporter};
 
 const MIDI_DIR: &str = "../test-asset";
 
@@ -117,6 +119,13 @@ fn list_midis(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn main() {
+    #[cfg(feature = "memory-report")]
+    let _memory_reporter = if env::var("MIDLY_MEM_REPORT").is_ok() {
+        Some(MemoryReporter::start("collectinfo", Duration::from_secs(1)))
+    } else {
+        None
+    };
+
     let midi_filter = env::args().nth(1).unwrap_or_default().to_lowercase();
     let info_filter = env::args().nth(2).unwrap_or_default().to_lowercase();
     let midi_dir = env::args().nth(3).unwrap_or(MIDI_DIR.to_string());
@@ -167,6 +176,8 @@ fn main() {
                         eprintln!("collector error ({})", err);
                     }
                 }
+                #[cfg(feature = "memory-report")]
+                print_memory_usage(&format!("after {} collector", name));
             }
             eprintln!();
         }

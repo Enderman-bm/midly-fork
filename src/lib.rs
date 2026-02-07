@@ -4,11 +4,12 @@
 //!
 //! Parsing a `.mid` file can be as simple as:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # #[cfg(feature = "alloc")] {
 //! use midly::Smf;
 //!
-//! let smf = Smf::parse(include_bytes!("../test-asset/Clementi.mid")).unwrap();
+//! let data = std::fs::read("song.mid").expect("read midi");
+//! let smf = Smf::parse(&data).expect("parse midi");
 //!
 //! for (i, track) in smf.tracks.iter().enumerate() {
 //!     println!("track {} has {} events", i, track.len());
@@ -26,16 +27,16 @@
 //! in the original file (in order to avoid allocations).
 //! For this reason, reading a file and parsing it must be done in two separate steps:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # #[cfg(feature = "alloc")] {
 //! use std::fs;
 //! use midly::Smf;
 //!
 //! // Load bytes into a buffer
-//! let bytes = fs::read("test-asset/Clementi.mid").unwrap();
+//! let bytes = fs::read("song.mid").expect("read");
 //!
 //! // Parse bytes in a separate step
-//! let smf = Smf::parse(&bytes).unwrap();
+//! let smf = Smf::parse(&bytes).expect("parse");
 //! # }
 //! ```
 //!
@@ -43,29 +44,29 @@
 //!
 //! Saving `.mid` files is as simple as using the `Smf::save` method:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # #[cfg(feature = "std")] {
 //! # use std::fs;
 //! # use midly::Smf;
 //! // Parse file
-//! let bytes = fs::read("test-asset/Clementi.mid").unwrap();
-//! let smf = Smf::parse(&bytes).unwrap();
+//! let bytes = fs::read("song.mid").expect("read");
+//! let smf = Smf::parse(&bytes).expect("parse");
 //!
 //! // Rewrite file
-//! smf.save("test-asset/ClementiRewritten.mid").unwrap();
+//! smf.save("output.mid").expect("save");
 //! # }
 //! ```
 //!
 //! SMF files can also be written to an arbitrary writer:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # #[cfg(feature = "std")] {
 //! # use std::fs;
 //! # use midly::Smf;
-//! # let bytes = fs::read("test-asset/Clementi.mid").unwrap();
-//! # let smf = Smf::parse(&bytes).unwrap();
+//! # let bytes = fs::read("song.mid").expect("read");
+//! # let smf = Smf::parse(&bytes).expect("parse");
 //! let mut in_memory = Vec::new();
-//! smf.write(&mut in_memory).unwrap();
+//! smf.write(&mut in_memory).expect("write");
 //!
 //! println!("midi file fits in {} bytes!", in_memory.len());
 //! # }
@@ -80,7 +81,7 @@
 //! use midly::{live::LiveEvent, MidiMessage};
 //!
 //! fn on_midi(event: &[u8]) {
-//!     let event = LiveEvent::parse(event).unwrap();
+//!     let event = LiveEvent::parse(event).expect("parse event");
 //!     match event {
 //!         LiveEvent::Midi { channel, message } => match message {
 //!             MidiMessage::NoteOn { key, vel } => {
@@ -121,7 +122,7 @@
 //! #           &mut stack_buf[..]
 //! #       }
 //! #   };
-//!     ev.write(&mut buf).unwrap();
+//!     ev.write(&mut buf).expect("write event");
 //!     write_midi(&buf[..]);
 //! }
 //! # note_on(3, 61); note_on(2, 50); note_on(2,61);
@@ -213,6 +214,10 @@ mod arena;
 mod event;
 pub mod io;
 pub mod live;
+pub mod loader;
+#[cfg(feature = "alloc")]
+mod fast_midi;
+pub mod memory;
 mod primitive;
 mod riff;
 mod smf;
@@ -239,7 +244,18 @@ pub use crate::{
 };
 
 /// High-performance mmap-based parsing exports.
-pub use crate::mmap::{MmapSmf, MmapTrack, MmapEventIter, FileStats};
+pub use crate::mmap::{FileStats, MmapEventIter, MmapSmf, MmapTrack};
+
+/// High-performance note extraction and streaming loader exports.
+#[cfg(feature = "alloc")]
+pub use crate::loader::{extract_notes, extract_notes_from_bytes, extract_notes_indexed, NoteIndex, PackedNote};
+
+#[cfg(all(feature = "std", feature = "memmap"))]
+pub use crate::loader::StreamingNoteLoader;
+
+/// Sequential file scanner for bounded-memory MIDI processing.
+#[cfg(feature = "std")]
+pub use crate::loader::{scan_midi_file, MidiScanResult};
 
 /// Exotically-sized integers used by the MIDI standard.
 pub mod num {

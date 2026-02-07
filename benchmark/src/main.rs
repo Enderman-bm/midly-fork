@@ -1,108 +1,128 @@
 use std::{
-    env, fs,
-    path::{Path, PathBuf},
+    env,
+    path::Path,
     time::Instant,
 };
 
-const MIDI_DIR: &str = "../test-asset";
+const DEFAULT_MIDI_PATH: &str = "test-asset/Funky Stars Black Redone.mid";
 
-const MIDI_EXT: &[&str] = &["mid", "midi", "rmi"];
+/// Lightweight process memory info using Windows API directly.
+/// Returns (working_set_bytes, pagefile_usage_bytes).
+/// - working_set = physical memory (RSS)
+/// - pagefile_usage = committed private virtual memory
+#[cfg(windows)]
+fn get_memory_info() -> (u64, u64) {
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
 
-fn parse_midly(data: &[u8]) -> Result<usize, String> {
-    let smf = midly::Smf::parse(data).map_err(|err| format!("{}", err))?;
-    Ok(smf.tracks.len())
-}
+    extern "system" {
+        fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            ppsmemcounters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    }
 
-fn list_midis(dir: &Path) -> Vec<PathBuf> {
-    let mut midis = Vec::new();
-    for entry in fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if MIDI_EXT
-            .iter()
-            .any(|ext| path.extension() == Some(ext.as_ref()))
-        {
-            midis.push(path);
+    unsafe {
+        let mut pmc: ProcessMemoryCounters = core::mem::zeroed();
+        pmc.cb = core::mem::size_of::<ProcessMemoryCounters>() as u32;
+        let handle = GetCurrentProcess();
+        if K32GetProcessMemoryInfo(handle, &mut pmc, pmc.cb) != 0 {
+            (pmc.working_set_size as u64, pmc.pagefile_usage as u64)
+        } else {
+            (0, 0)
         }
     }
-    midis
 }
 
-fn use_parser(parse: fn(&[u8]) -> Result<usize, String>, data: &[u8]) -> Result<(), String> {
-    let round = |num: f64| (num * 100.0).round() / 100.0;
+#[cfg(not(windows))]
+fn get_memory_info() -> (u64, u64) {
+    (0, 0)
+}
 
-    let runtime = || -> Result<_, String> {
-        let start = Instant::now();
-        let out = parse(data)?;
-        let time = round((start.elapsed().as_micros() as f64) / 1000.0);
-        Ok((out, time))
-    };
-
-    let (track_count, cold_time) = runtime()?;
-    let runtime = || -> Result<_, String> {
-        let (out, time) = runtime()?;
-        assert_eq!(
-            out, track_count,
-            "parser is not consistent with track counts"
-        );
-        Ok(time)
-    };
-
-    let iters = (2000.0 / cold_time).floor() as u64 + 1;
-    let mut total_time = 0.0;
-    let mut max_time = cold_time;
-    let mut min_time = cold_time;
-    for _ in 0..iters {
-        let time = runtime()?;
-        total_time += time;
-        max_time = max_time.max(time);
-        min_time = min_time.min(time);
-    }
-    let avg_time = round(total_time / (iters as f64));
-
+fn print_memory(label: &str) {
+    let (rss, virt) = get_memory_info();
+    let rss_kb = rss / 1024;
+    let virt_kb = virt / 1024;
+    let total_mb = (rss + virt) as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "{} tracks in {} iters / min {} / avg {} / max {}",
-        track_count, iters, min_time, avg_time, max_time
+        "  [mem] {}: rss={} KB, virtual={} KB, total={:.2} MB",
+        label, rss_kb, virt_kb, total_mb
     );
-
-    Ok(())
 }
 
 fn main() {
-    let midi_filter = env::args().nth(1).unwrap_or_default().to_lowercase();
-    let midi_dir = env::args().nth(2).unwrap_or(MIDI_DIR.to_string());
+    let override_path = env::args().nth(1);
+    let midi_path = match override_path.as_deref() {
+        Some(p) => p,
+        None => DEFAULT_MIDI_PATH,
+    };
+    let path = Path::new(midi_path);
 
-    let unfiltered_midis = list_midis(midi_dir.as_ref());
-    let midis = unfiltered_midis
-        .iter()
-        .filter(|midi| {
-            midi.file_name()
-                .unwrap_or_default()
-                .to_str()
-                .expect("non-utf8 file")
-                .to_lowercase()
-                .contains(&midi_filter)
-        })
-        .collect::<Vec<_>>();
-    if midis.is_empty() {
-        eprintln!("no midi files match the pattern \"{}\"", midi_filter);
-        eprintln!("available midi files:");
-        for file in unfiltered_midis.iter() {
-            eprintln!("  {}", file.display());
-        }
-    } else {
-        for midi in midis {
-            //Read file once and reuse for all iterations
-            let data = fs::read(midi).map_err(|err| format!("{}", err)).unwrap();
-            let size = data.len();
-            eprintln!("parsing file \"{}\" ({} KB)", midi.display(), size / 1024);
-            eprint!("  midly: ");
-            match use_parser(parse_midly, &data) {
-                Ok(()) => {}
-                Err(_err) => {
-                    eprintln!("parse error");
-                }
-            }
+    if !path.exists() {
+        eprintln!("ERROR: MIDI file not found: {}", path.display());
+        eprintln!("Usage: benchmark [path_to_midi_file]");
+        std::process::exit(1);
+    }
+
+    let file_size = std::fs::metadata(path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    eprintln!("=== MIDI Benchmark ===");
+    eprintln!("File: {} ({:.1} MB)", path.display(), file_size as f64 / (1024.0 * 1024.0));
+    eprintln!();
+
+    print_memory("startup");
+
+    // --- Sequential scan: bounded memory, fast ---
+    eprintln!("--- scan_midi_file (sequential, bounded memory) ---");
+    let start = Instant::now();
+    match midly::scan_midi_file(path) {
+        Ok(result) => {
+            let elapsed = start.elapsed();
+            let ms = elapsed.as_secs_f64() * 1000.0;
+            eprintln!("  Tracks:        {}", result.track_count);
+            eprintln!("  Notes:         {}", result.note_count);
+            eprintln!("  Tempo changes: {}", result.tempo_changes.len());
+            eprintln!("  Max tick:      {}", result.max_tick);
+            eprintln!("  Division:      {}", result.division);
+            eprintln!("  Time:          {:.2} ms", ms);
+
+            print_memory("after scan");
+
+            let (rss, virt) = get_memory_info();
+            let total_mb = (rss + virt) as f64 / (1024.0 * 1024.0);
+
             eprintln!();
+            eprintln!("=== Result ===");
+            if ms < 3000.0 {
+                eprintln!("  Speed:  PASS ({:.2} ms < 3000 ms)", ms);
+            } else {
+                eprintln!("  Speed:  FAIL ({:.2} ms >= 3000 ms)", ms);
+            }
+            if total_mb < 30.0 {
+                eprintln!("  Memory: PASS ({:.2} MB < 30 MB)", total_mb);
+            } else {
+                eprintln!("  Memory: FAIL ({:.2} MB >= 30 MB)", total_mb);
+            }
+        }
+        Err(e) => {
+            eprintln!("  FAILED: {}", e);
         }
     }
+
+    print_memory("end");
 }

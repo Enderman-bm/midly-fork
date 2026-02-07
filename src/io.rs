@@ -122,11 +122,7 @@ impl Write for Vec<u8> {
             let len = self.len();
             let cap = self.capacity();
             debug_assert!(len + buf.len() <= cap);
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                self.as_mut_ptr().add(len),
-                buf.len()
-            );
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), self.as_mut_ptr().add(len), buf.len());
             self.set_len(len + buf.len());
         }
         Ok(())
@@ -159,11 +155,7 @@ impl Seek for Vec<u8> {
         }
         // SAFETY: We just checked the bounds
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                self.as_mut_ptr().add(pos),
-                buf.len()
-            );
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), self.as_mut_ptr().add(pos), buf.len());
         }
         Ok(())
     }

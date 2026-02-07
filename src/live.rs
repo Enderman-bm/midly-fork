@@ -192,9 +192,9 @@ impl<'a> LiveEvent<'a> {
                     let mut buf = [0; 4];
                     let rem_bytes = {
                         let mut buf_ref = &mut buf[..];
-                        syscommon
-                            .write(&mut buf_ref)
-                            .expect("failed to write system common message");
+                        if let Err(_) = syscommon.write(&mut buf_ref) {
+                            return TrackEventKind::Escape(arena.add(&[]));
+                        }
                         buf_ref.len()
                     };
                     let bytes = &buf[..buf.len() - rem_bytes];
@@ -238,10 +238,13 @@ impl<'a> SystemCommon<'a> {
             }
             0xF1 if data.len() >= 1 => {
                 //MTC Quarter Frame
-                SystemCommon::MidiTimeCodeQuarterFrame(
-                    MtcQuarterFrameMessage::from_code(data[0].as_int() >> 4).unwrap(),
-                    u4::from(data[0].as_int()),
-                )
+                match MtcQuarterFrameMessage::from_code(data[0].as_int() >> 4) {
+                    Some(msg) => SystemCommon::MidiTimeCodeQuarterFrame(
+                        msg,
+                        u4::from(data[0].as_int()),
+                    ),
+                    None => bail!(err_invalid!("invalid MTC quarter frame code")),
+                }
             }
             0xF2 if data.len() >= 2 => {
                 //Song Position

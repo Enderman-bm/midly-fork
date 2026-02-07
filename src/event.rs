@@ -29,11 +29,11 @@ impl<'a> TrackEvent<'a> {
         // Fast path: minimize error handling overhead
         let delta = match u28::read_u7(raw) {
             Ok(d) => d,
-            Err(e) => bail!(err_invalid!("failed to read event deltatime")),
+            Err(_err) => bail!(err_invalid!("failed to read event deltatime")),
         };
         let kind = match TrackEventKind::read(raw, running_status) {
             Ok(k) => k,
-            Err(e) => bail!(err_invalid!("failed to parse event")),
+            Err(_err) => bail!(err_invalid!("failed to parse event")),
         };
         Ok(TrackEvent { delta, kind })
     }
@@ -109,9 +109,9 @@ impl<'a> TrackEventKind<'a> {
         if raw.is_empty() {
             bail!(err_invalid!("failed to read status"));
         }
-        
+
         let mut status = unsafe { *raw.as_ptr() };
-        
+
         if status < 0x80 {
             // Running status - use cached status
             status = match *running_status {
@@ -138,26 +138,20 @@ impl<'a> TrackEventKind<'a> {
             let (channel, message) = MidiMessage::read(status, data);
             return Ok(TrackEventKind::Midi { channel, message });
         }
-        
+
         // Clear running status for system messages
         *running_status = None;
-        
+
         match status {
-            0xFF => {
-                Ok(TrackEventKind::Meta(
-                    MetaMessage::read(raw).context(err_invalid!("failed to read meta event"))?,
-                ))
-            }
-            0xF0 => {
-                Ok(TrackEventKind::SysEx(
-                    read_varlen_slice(raw).context(err_invalid!("failed to read sysex event"))?,
-                ))
-            }
-            0xF7 => {
-                Ok(TrackEventKind::Escape(
-                    read_varlen_slice(raw).context(err_invalid!("failed to read escape event"))?,
-                ))
-            }
+            0xFF => Ok(TrackEventKind::Meta(
+                MetaMessage::read(raw).context(err_invalid!("failed to read meta event"))?,
+            )),
+            0xF0 => Ok(TrackEventKind::SysEx(
+                read_varlen_slice(raw).context(err_invalid!("failed to read sysex event"))?,
+            )),
+            0xF7 => Ok(TrackEventKind::Escape(
+                read_varlen_slice(raw).context(err_invalid!("failed to read escape event"))?,
+            )),
             0xF1..=0xF6 => bail!(err_invalid!(
                 "standard midi files cannot contain system common events"
             )),
@@ -315,12 +309,12 @@ impl MidiMessage {
     pub(crate) fn read_data_u8(status: u8, raw: &mut &[u8]) -> Result<[u7; 2]> {
         let len = Self::msg_length(status);
         let raw_len = raw.len();
-        
+
         // Fast path: inline the split_checked logic with pointer arithmetic
         if raw_len < len {
             bail!(err_invalid!("truncated midi message"));
         }
-        
+
         unsafe {
             let ptr = raw.as_ptr();
             let result = match len {
