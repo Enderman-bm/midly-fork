@@ -270,7 +270,7 @@ struct NoteAccumulator {
 impl NoteAccumulator {
     fn new(track_idx: u16) -> Self {
         Self {
-            notes: Vec::with_capacity(10_000),
+            notes: Vec::with_capacity(512),
             tempo_changes: Vec::new(),
             active_notes: [None; 128],
             current_tick: 0,
@@ -751,8 +751,8 @@ impl StreamingNoteLoader {
             parsed_until: 0,
             active_notes: vec![[None; 128]; num_tracks],
             finished_notes: VecDeque::new(),
-            max_finished_notes: 50_000, // Reduced for strict memory limit
-            frame_notes: Vec::with_capacity(4096),
+            max_finished_notes: 32_768,
+            frame_notes: Vec::with_capacity(2048),
             active_keys: [None; 128],
         })
     }
@@ -1012,6 +1012,10 @@ pub struct MidiScanResult {
 /// # Ok(())
 /// # }
 /// ```
+/// Single buffer size for sequential read; tracks are parsed in parallel from slices of this buffer.
+#[cfg(all(feature = "std", feature = "parallel"))]
+const PARALLEL_BATCH_BYTES: usize = 20 * 1024 * 1024;
+
 #[cfg(feature = "std")]
 pub fn scan_midi_file(path: &std::path::Path) -> crate::Result<MidiScanResult> {
     use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -1020,16 +1024,14 @@ pub fn scan_midi_file(path: &std::path::Path) -> crate::Result<MidiScanResult> {
         crate::Error::new(&crate::ErrorKind::Invalid("failed to open midi file"))
     })?;
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(4096);
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
 
-    // Read first 4 bytes to detect RIFF wrapper vs standard MIDI
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic).map_err(|_| {
         crate::Error::new(&crate::ErrorKind::Invalid("file too short"))
     })?;
 
     if &magic == b"RIFF" {
-        // Scan forward for MThd within first 4KB of RIFF wrapper
         reader.seek(SeekFrom::Start(0)).map_err(|_| {
             crate::Error::new(&crate::ErrorKind::Invalid("seek failed"))
         })?;
@@ -1054,7 +1056,6 @@ pub fn scan_midi_file(path: &std::path::Path) -> crate::Result<MidiScanResult> {
         return Err(crate::Error::new(&crate::ErrorKind::Invalid("not a MIDI file")));
     }
 
-    // Read the 14-byte MThd header
     let mut header_buf = [0u8; 14];
     reader.read_exact(&mut header_buf).map_err(|_| {
         crate::Error::new(&crate::ErrorKind::Invalid("truncated MIDI header"))
@@ -1071,7 +1072,6 @@ pub fn scan_midi_file(path: &std::path::Path) -> crate::Result<MidiScanResult> {
         return Err(crate::Error::new(&crate::ErrorKind::Invalid("MIDI header too short")));
     }
 
-    // Skip any extra header bytes beyond the standard 6
     if header_len > 6 {
         let skip = (header_len - 6) as i64;
         reader.seek(SeekFrom::Current(skip)).map_err(|_| {
@@ -1090,94 +1090,120 @@ pub fn scan_midi_file(path: &std::path::Path) -> crate::Result<MidiScanResult> {
         division,
     };
 
-    // Reusable buffer for track data - grows to fit the largest track, then reused
-    let mut track_buf: Vec<u8> = Vec::new();
+    #[cfg(feature = "parallel")]
+    {
+        // Single buffer: sequential read, parallel parse per batch (no copy, no extra thread).
+        let mut buf = vec![0u8; PARALLEL_BATCH_BYTES];
+        let mut buf_used = 0usize;
+        let mut batch: Vec<(usize, usize)> = Vec::new();
 
-    // Read chunks sequentially until we have all tracks
-    loop {
-        if result.track_count >= tracks_count {
-            break;
-        }
-
-        // Read chunk header (8 bytes: 4 type + 4 length)
         let mut chunk_header = [0u8; 8];
-        if reader.read_exact(&mut chunk_header).is_err() {
-            break; // EOF
-        }
-
-        let chunk_len = u32::from_be_bytes([
-            chunk_header[4], chunk_header[5],
-            chunk_header[6], chunk_header[7],
-        ]);
-
-        if &chunk_header[0..4] != b"MTrk" {
-            // Skip non-track chunk
-            if reader.seek(SeekFrom::Current(chunk_len as i64)).is_err() {
+        loop {
+            if result.track_count >= tracks_count {
                 break;
             }
-            continue;
+            if reader.read_exact(&mut chunk_header).is_err() {
+                break;
+            }
+            let chunk_len = u32::from_be_bytes([
+                chunk_header[4], chunk_header[5],
+                chunk_header[6], chunk_header[7],
+            ]);
+            if &chunk_header[0..4] != b"MTrk" {
+                let _ = reader.seek(SeekFrom::Current(chunk_len as i64));
+                continue;
+            }
+            let track_len = chunk_len as usize;
+            if track_len > PARALLEL_BATCH_BYTES {
+                if !batch.is_empty() {
+                    let results: Vec<(u64, u32, Vec<(u32, f32)>)> = batch
+                        .par_iter()
+                        .map(|&(start, len)| fast_midi::scan_track_notes_only(&buf[start..start + len]))
+                        .collect();
+                    for (notes, max_tick, tempos) in results {
+                        result.note_count += notes;
+                        result.max_tick = result.max_tick.max(max_tick);
+                        result.tempo_changes.extend(tempos);
+                    }
+                    batch.clear();
+                    buf_used = 0;
+                }
+                let mut big = vec![0u8; track_len];
+                if reader.read_exact(&mut big).is_err() {
+                    break;
+                }
+                result.track_count += 1;
+                let (notes, max_tick, tempos) = fast_midi::scan_track_notes_only(&big);
+                result.note_count += notes;
+                result.max_tick = result.max_tick.max(max_tick);
+                result.tempo_changes.extend(tempos);
+                continue;
+            }
+            if buf_used + track_len > buf.len() {
+                let results: Vec<(u64, u32, Vec<(u32, f32)>)> = batch
+                    .par_iter()
+                    .map(|&(start, len)| fast_midi::scan_track_notes_only(&buf[start..start + len]))
+                    .collect();
+                for (notes, max_tick, tempos) in results {
+                    result.note_count += notes;
+                    result.max_tick = result.max_tick.max(max_tick);
+                    result.tempo_changes.extend(tempos);
+                }
+                batch.clear();
+                buf_used = 0;
+            }
+            if reader.read_exact(&mut buf[buf_used..buf_used + track_len]).is_err() {
+                break;
+            }
+            batch.push((buf_used, track_len));
+            buf_used += track_len;
+            result.track_count += 1;
         }
 
-        let track_len = chunk_len as usize;
-
-        // Read track data into reusable buffer
-        track_buf.clear();
-        track_buf.resize(track_len, 0);
-        if reader.read_exact(&mut track_buf).is_err() {
-            break; // Truncated track
-        }
-
-        // Parse track events using the fast iterator
-        let mut iter = FastTrackIter::new(&track_buf);
-        let mut active_notes: [bool; 128] = [false; 128];
-        let mut current_tick = 0u32;
-
-        while let Some((delta, event)) = iter.next_event() {
-            current_tick = current_tick.saturating_add(delta);
-            match event {
-                MidiEvent::NoteOn { key, velocity, .. } => {
-                    let k = (key & 0x7F) as usize;
-                    if velocity > 0 {
-                        if active_notes[k] {
-                            result.note_count += 1; // Close overlapping note
-                        }
-                        active_notes[k] = true;
-                    } else if active_notes[k] {
-                        active_notes[k] = false;
-                        result.note_count += 1;
-                    }
-                }
-                MidiEvent::NoteOff { key, .. } => {
-                    let k = (key & 0x7F) as usize;
-                    if active_notes[k] {
-                        active_notes[k] = false;
-                        result.note_count += 1;
-                    }
-                }
-                MidiEvent::Meta { event_type: 0x51, data } => {
-                    if data.len() == 3 {
-                        let us = ((data[0] as u32) << 16)
-                            | ((data[1] as u32) << 8)
-                            | (data[2] as u32);
-                        if us > 0 {
-                            let bpm = 60_000_000.0 / us as f32;
-                            result.tempo_changes.push((current_tick, bpm));
-                        }
-                    }
-                }
-                _ => {}
+        if !batch.is_empty() {
+            let results: Vec<(u64, u32, Vec<(u32, f32)>)> = batch
+                .par_iter()
+                .map(|&(start, len)| fast_midi::scan_track_notes_only(&buf[start..start + len]))
+                .collect();
+            for (notes, max_tick, tempos) in results {
+                result.note_count += notes;
+                result.max_tick = result.max_tick.max(max_tick);
+                result.tempo_changes.extend(tempos);
             }
         }
+    }
 
-        // Close remaining active notes
-        for active in &active_notes {
-            if *active {
-                result.note_count += 1;
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut track_buf: Vec<u8> = Vec::new();
+        loop {
+            if result.track_count >= tracks_count {
+                break;
             }
+            let mut chunk_header = [0u8; 8];
+            if reader.read_exact(&mut chunk_header).is_err() {
+                break;
+            }
+            let chunk_len = u32::from_be_bytes([
+                chunk_header[4], chunk_header[5],
+                chunk_header[6], chunk_header[7],
+            ]);
+            if &chunk_header[0..4] != b"MTrk" {
+                let _ = reader.seek(SeekFrom::Current(chunk_len as i64));
+                continue;
+            }
+            let track_len = chunk_len as usize;
+            track_buf.clear();
+            track_buf.resize(track_len, 0);
+            if reader.read_exact(&mut track_buf).is_err() {
+                break;
+            }
+            let (track_notes, track_max_tick, track_tempos) = fast_midi::scan_track_notes_only(&track_buf);
+            result.note_count += track_notes;
+            result.max_tick = result.max_tick.max(track_max_tick);
+            result.tempo_changes.extend(track_tempos);
+            result.track_count += 1;
         }
-
-        result.max_tick = result.max_tick.max(current_tick);
-        result.track_count += 1;
     }
 
     result.tempo_changes.sort_unstable_by_key(|&(t, _)| t);

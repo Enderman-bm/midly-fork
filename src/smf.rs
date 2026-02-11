@@ -38,11 +38,14 @@ const BYTES_TO_EVENTS: f32 = 1.0 / 3.0;
 #[cfg(feature = "alloc")]
 const EVENTS_TO_BYTES: f32 = 3.4;
 
-/// How many bytes must a MIDI body have in order to enable multithreading.
-///
-/// When writing, the MIDI body size is estimated from the event count using `BYTES_PER_EVENT`.
+/// Minimum unread byte length to enable parallel track parsing.
+/// Kept high to avoid thread spawn overhead and extra memory for small files.
 #[cfg(feature = "parallel")]
-const PARALLEL_ENABLE_THRESHOLD: usize = 1024; // Lower threshold for earlier parallelization
+const PARALLEL_PARSE_THRESHOLD: usize = 256 * 1024;
+
+/// Minimum estimated encoded size (bytes) to enable parallel writing.
+#[cfg(feature = "parallel")]
+const PARALLEL_WRITE_THRESHOLD: usize = 64 * 1024;
 
 /// A single track: simply a list of track events.
 ///
@@ -326,7 +329,7 @@ where
         //Figure out whether multithreading is worth it
         let tracks_vec: Vec<_> = tracks_iter.collect();
         let event_count: usize = tracks_vec.iter().map(|track| track.size_hint().0).sum();
-        if (event_count as f32 * EVENTS_TO_BYTES) > PARALLEL_ENABLE_THRESHOLD as f32 {
+        if (event_count as f32 * EVENTS_TO_BYTES) > PARALLEL_WRITE_THRESHOLD as f32 {
             use rayon::prelude::*;
 
             // Pre-allocate with exact capacity to avoid reallocations
@@ -666,8 +669,7 @@ impl<'a> TrackIter<'a> {
         #[cfg(feature = "parallel")]
         {
             let unread_len = self.unread().len();
-            // Use parallel parsing for large files (>1MB) or many tracks
-            if unread_len >= PARALLEL_ENABLE_THRESHOLD {
+            if unread_len >= PARALLEL_PARSE_THRESHOLD {
                 use rayon::prelude::*;
 
                 let chunk_vec = self.collect::<Result<Vec<_>>>()?;
@@ -766,14 +768,15 @@ impl<'a, T: EventKind<'a>> EventIterGeneric<'a, T> {
     #[cfg(feature = "alloc")]
     #[inline]
     fn estimate_events(&self) -> usize {
-        // More aggressive estimation for large files
         let bytes = self.raw.len();
-        if bytes > 1024 * 1024 {
-            // For large files, assume ~3 bytes per event (typical for dense MIDI)
+        let raw_estimate = if bytes > 1024 * 1024 {
             bytes / 3
         } else {
             (bytes as f32 * BYTES_TO_EVENTS) as usize
-        }
+        };
+        // Cap initial capacity to limit peak memory during parse (realloc when needed)
+        const MAX_INITIAL_EVENTS: usize = 1 << 20;
+        raw_estimate.min(MAX_INITIAL_EVENTS)
     }
 
     #[cfg(feature = "alloc")]

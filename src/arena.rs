@@ -34,8 +34,8 @@ pub struct Arena {
     total_allocated: UnsafeCell<usize>,
 }
 
-/// Default chunk size: 64KB - good balance between allocation overhead and memory waste
-const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+/// Default chunk size: 32KB for lower memory footprint; still avoids frequent realloc
+const DEFAULT_CHUNK_SIZE: usize = 32 * 1024;
 /// Minimum allocation size to get its own chunk (larger than this = dedicated chunk)
 const LARGE_ALLOC_THRESHOLD: usize = 16 * 1024;
 

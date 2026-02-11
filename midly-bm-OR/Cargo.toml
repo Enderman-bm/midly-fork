@@ -1,0 +1,9 @@
+[package]
+name = "midly-bm-OR"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+midly = { path = ".." }
+clap = { version = "4.0", features = ["derive"] }
+memmap2 = "0.9"

@@ -64,11 +64,15 @@ fn print_memory(label: &str) {
 }
 
 fn main() {
-    let override_path = env::args().nth(1);
-    let midi_path = match override_path.as_deref() {
-        Some(p) => p,
-        None => DEFAULT_MIDI_PATH,
+    // Collect all args after the program name and join with spaces. This lets users
+    // pass an unquoted path that contains spaces (e.g. `benchmark path to midi file.mid`).
+    let override_args: Vec<String> = env::args().skip(1).collect();
+    let midi_path_owned: Option<String> = if override_args.is_empty() {
+        None
+    } else {
+        Some(override_args.join(" "))
     };
+    let midi_path = midi_path_owned.as_deref().unwrap_or(DEFAULT_MIDI_PATH);
     let path = Path::new(midi_path);
 
     if !path.exists() {

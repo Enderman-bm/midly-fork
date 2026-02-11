@@ -9,7 +9,7 @@ include = [
 ]
 
 [workspace]
-members = ["benchmark", "collectinfo"]
+members = ["benchmark", "collectinfo", "midly-bm-OR"]
 description = "Fast MIDI decoder and encoder both for .mid files and real-time MIDI events"
 repository = "https://github.com/negamartin/midly"
 readme = "README.md"
