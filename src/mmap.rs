@@ -275,18 +275,22 @@ fn parse_channel_message<'a>(
                     "truncated channel message",
                 )));
             }
-            let b1 = u7::new(data[0]);
-            let b2 = u7::new(data[1]);
+            // 保存原始字节再 advance data！Line 280 *data = &data[2..] 之后
+            // data[0]/data[1] 指向的是下一个事件的字节，不是当前事件的。
+            let param1_raw = data[0];
+            let param2_raw = data[1];
+            let b1 = u7::new(param1_raw);
+            let b2 = u7::new(param2_raw);
             *data = &data[2..];
 
             let message = match msg_type {
                 0x8 => MidiMessage::NoteOff {
-                    key: data[0],
-                    vel: u7::new(data[1]),
+                    key: param1_raw,
+                    vel: b2,
                 },
                 0x9 => MidiMessage::NoteOn {
-                    key: data[0],
-                    vel: u7::new(data[1]),
+                    key: param1_raw,
+                    vel: b2,
                 },
                 0xA => MidiMessage::Aftertouch { key: b1, vel: b2 },
                 0xB => MidiMessage::Controller {
