@@ -523,7 +523,8 @@ fn parse_header_tracks(data: &[u8]) -> crate::Result<(Header, Vec<&[u8]>)> {
     let header = Header { format, timing };
 
     // Parse tracks
-    let mut pos = 8 + 4 + header_len; // MThd + length + header data
+    // 8 = MThd(4) + length field(4), then skip header data bytes
+    let mut pos = 8 + header_len;
     // Cap pre-allocation to avoid huge allocations from malformed headers
     let max_tracks_possible = data.len().saturating_sub(pos) / 8;
     if cfg!(feature = "strict") && (num_tracks as usize) > max_tracks_possible {
