@@ -53,8 +53,8 @@ use rayon::prelude::*;
 
 /// A compact, packed representation of a MIDI note.
 ///
-/// This structure uses only **12 bytes** compared to 24+ bytes for a typical
-/// `(start_tick, end_tick, key, velocity, track)` tuple, saving 50% memory.
+/// This structure uses only **13 bytes** compared to 24+ bytes for a typical
+/// `(start_tick, end_tick, key, velocity, channel, track)` tuple, saving ~46% memory.
 ///
 /// The `#[repr(C, packed)]` layout ensures optimal cache efficiency when
 /// processing large MIDI files with millions of notes.
@@ -69,6 +69,8 @@ pub struct PackedNote {
     pub key: u8,
     /// Note velocity (0-127) (1 byte)
     pub velocity: u8,
+    /// MIDI channel (0-15) (1 byte)
+    pub channel: u8,
     /// Track index, supports up to 65535 tracks (2 bytes)
     pub track: u16,
 }
@@ -159,12 +161,13 @@ impl PackedControlEvent {
 impl PackedNote {
     /// Create a new packed note.
     #[inline]
-    pub fn new(start_tick: u32, end_tick: u32, key: u8, velocity: u8, track: u16) -> Self {
+    pub fn new(start_tick: u32, end_tick: u32, key: u8, velocity: u8, channel: u8, track: u16) -> Self {
         Self {
             start_tick,
             end_tick,
             key,
             velocity: velocity & 0x7F,
+            channel: channel & 0x0F,
             track,
         }
     }
@@ -219,9 +222,9 @@ impl NoteIndex {
     /// use midly::loader::{PackedNote, NoteIndex};
     ///
     /// let notes = vec![
-    ///     PackedNote::new(0, 100, 60, 100, 0),
-    ///     PackedNote::new(50, 150, 64, 100, 0),
-    ///     PackedNote::new(200, 300, 67, 100, 1),
+    ///     PackedNote::new(0, 100, 60, 100, 0, 0),
+    ///     PackedNote::new(50, 150, 64, 100, 0, 0),
+    ///     PackedNote::new(200, 300, 67, 100, 0, 1),
     /// ];
     ///
     /// let index = NoteIndex::build(notes, 100);
@@ -337,7 +340,7 @@ struct ActiveNote {
 struct NoteAccumulator {
     notes: Vec<PackedNote>,
     tempo_changes: Vec<(u32, f32)>,
-    active_notes: [Option<(u32, u8)>; 256],
+    active_notes: [[Option<(u32, u8)>; 256]; 16],
     current_tick: u32,
     track_idx: u16,
 }
@@ -348,7 +351,7 @@ impl NoteAccumulator {
         Self {
             notes: Vec::with_capacity(512),
             tempo_changes: Vec::new(),
-            active_notes: [None; 256],
+            active_notes: [[None; 256]; 16],
             current_tick: 0,
             track_idx,
         }
@@ -359,38 +362,42 @@ impl NoteAccumulator {
         self.current_tick = self.current_tick.saturating_add(delta);
     }
 
-    fn note_on(&mut self, key: u8, velocity: u8) {
+    fn note_on(&mut self, key: u8, velocity: u8, channel: u8) {
+        let ch = channel.min(15) as usize;
         let key_idx = key as usize;
         if key_idx >= 256 {
             return;
         }
 
-        if let Some((start_tick, prev_velocity)) = self.active_notes[key_idx].take() {
+        if let Some((start_tick, prev_velocity)) = self.active_notes[ch][key_idx].take() {
             self.notes.push(PackedNote::new(
                 start_tick,
                 self.current_tick,
                 key,
                 prev_velocity,
+                channel,
                 self.track_idx,
             ));
         }
 
         if velocity > 0 {
-            self.active_notes[key_idx] = Some((self.current_tick, velocity));
+            self.active_notes[ch][key_idx] = Some((self.current_tick, velocity));
         }
     }
 
-    fn note_off(&mut self, key: u8) {
+    fn note_off(&mut self, key: u8, channel: u8) {
+        let ch = channel.min(15) as usize;
         let key_idx = key as usize;
         if key_idx >= 256 {
             return;
         }
-        if let Some((start_tick, velocity)) = self.active_notes[key_idx].take() {
+        if let Some((start_tick, velocity)) = self.active_notes[ch][key_idx].take() {
             self.notes.push(PackedNote::new(
                 start_tick,
                 self.current_tick,
                 key,
                 velocity,
+                channel,
                 self.track_idx,
             ));
         }
@@ -404,15 +411,18 @@ impl NoteAccumulator {
     }
 
     fn finish(mut self) -> (Vec<PackedNote>, Vec<(u32, f32)>) {
-        for key in 0..256 {
-            if let Some((start_tick, velocity)) = self.active_notes[key].take() {
-                self.notes.push(PackedNote::new(
-                    start_tick,
-                    self.current_tick,
-                    key as u8,
-                    velocity,
-                    self.track_idx,
-                ));
+        for ch in 0..16 {
+            for key in 0..256 {
+                if let Some((start_tick, velocity)) = self.active_notes[ch][key].take() {
+                    self.notes.push(PackedNote::new(
+                        start_tick,
+                        self.current_tick,
+                        key as u8,
+                        velocity,
+                        ch as u8,
+                        self.track_idx,
+                    ));
+                }
             }
         }
         (self.notes, self.tempo_changes)
@@ -488,7 +498,7 @@ impl ControlEventAccumulator {
 pub struct NoteTrackCursor<'a> {
     #[allow(dead_code)]
     events: crate::smf::EventIter<'a>,
-    active_notes: [Option<ActiveNote>; 256],
+    active_notes: [[Option<ActiveNote>; 256]; 16],
     current_tick: u32,
     track_idx: u16,
 }
@@ -499,7 +509,7 @@ impl<'a> NoteTrackCursor<'a> {
     pub fn new(events: crate::smf::EventIter<'a>, track_idx: u16) -> Self {
         Self {
             events,
-            active_notes: [None; 256],
+            active_notes: [[None; 256]; 16],
             current_tick: 0,
             track_idx,
         }
@@ -514,15 +524,18 @@ impl<'a> NoteTrackCursor<'a> {
     /// Close all active notes, returning them as completed notes.
     pub fn close_all_notes(&mut self) -> Vec<PackedNote> {
         let mut completed = Vec::new();
-        for key in 0..256 {
-            if let Some(active) = self.active_notes[key].take() {
-                completed.push(PackedNote::new(
-                    active.start_tick,
-                    self.current_tick,
-                    key as u8,
-                    active.velocity,
-                    self.track_idx,
-                ));
+        for ch in 0..16 {
+            for key in 0..256 {
+                if let Some(active) = self.active_notes[ch][key].take() {
+                    completed.push(PackedNote::new(
+                        active.start_tick,
+                        self.current_tick,
+                        key as u8,
+                        active.velocity,
+                        ch as u8,
+                        self.track_idx,
+                    ));
+                }
             }
         }
         completed
@@ -609,16 +622,16 @@ fn parse_track_notes(track: &[TrackEvent], track_idx: u16) -> (Vec<PackedNote>, 
         acc.advance(event.delta.as_int());
 
         match &event.kind {
-            TrackEventKind::Midi {
-                channel: _,
-                message,
-            } => match message {
-                MidiMessage::NoteOn { key, vel } => {
-                    acc.note_on(*key, vel.as_int());
+            TrackEventKind::Midi { channel, message } => {
+                let ch = channel.as_int();
+                match message {
+                    MidiMessage::NoteOn { key, vel } => {
+                        acc.note_on(*key, vel.as_int(), ch);
+                    }
+                    MidiMessage::NoteOff { key, vel: _ } => acc.note_off(*key, ch),
+                    _ => {}
                 }
-                MidiMessage::NoteOff { key, vel: _ } => acc.note_off(*key),
-                _ => {}
-            },
+            }
             TrackEventKind::Meta(MetaMessage::Tempo(tempo)) => {
                 acc.tempo_microseconds(tempo.as_int());
             }
@@ -643,23 +656,26 @@ fn parse_track_notes_and_control_events(
         ctrl_acc.advance(delta);
 
         match &event.kind {
-            TrackEventKind::Midi { channel, message } => match message {
-                MidiMessage::NoteOn { key, vel } => {
-                    note_acc.note_on(*key, vel.as_int());
+            TrackEventKind::Midi { channel, message } => {
+                let ch = channel.as_int();
+                match message {
+                    MidiMessage::NoteOn { key, vel } => {
+                        note_acc.note_on(*key, vel.as_int(), ch);
+                    }
+                    MidiMessage::NoteOff { key, vel: _ } => note_acc.note_off(*key, ch),
+                    MidiMessage::Controller { controller, value } => {
+                        ctrl_acc.control_change(ch, controller.as_int(), value.as_int());
+                    }
+                    MidiMessage::ProgramChange { program } => {
+                        ctrl_acc.program_change(ch, program.as_int());
+                    }
+                    MidiMessage::PitchBend { bend } => {
+                        let bend_u16 = bend.as_int() as u16;
+                        ctrl_acc.pitch_bend(ch, bend_u16);
+                    }
+                    _ => {}
                 }
-                MidiMessage::NoteOff { key, vel: _ } => note_acc.note_off(*key),
-                MidiMessage::Controller { controller, value } => {
-                    ctrl_acc.control_change(channel.as_int(), controller.as_int(), value.as_int());
-                }
-                MidiMessage::ProgramChange { program } => {
-                    ctrl_acc.program_change(channel.as_int(), program.as_int());
-                }
-                MidiMessage::PitchBend { bend } => {
-                    let bend_u16 = bend.as_int() as u16;
-                    ctrl_acc.pitch_bend(channel.as_int(), bend_u16);
-                }
-                _ => {}
-            },
+            }
             TrackEventKind::Meta(MetaMessage::Tempo(tempo)) => {
                 note_acc.tempo_microseconds(tempo.as_int());
             }
@@ -996,8 +1012,8 @@ fn parse_fast_track_notes(
         acc.advance(delta);
 
         match event {
-            MidiEvent::NoteOn { key, velocity, .. } => acc.note_on(key, velocity),
-            MidiEvent::NoteOff { key, .. } => acc.note_off(key),
+            MidiEvent::NoteOn { channel, key, velocity } => acc.note_on(key, velocity, channel),
+            MidiEvent::NoteOff { channel, key, .. } => acc.note_off(key, channel),
             MidiEvent::Meta {
                 event_type: 0x51,
                 data,
@@ -1029,8 +1045,8 @@ fn parse_fast_track_notes_and_control_events(
         ctrl_acc.advance(delta);
 
         match event {
-            MidiEvent::NoteOn { key, velocity, .. } => note_acc.note_on(key, velocity),
-            MidiEvent::NoteOff { key, .. } => note_acc.note_off(key),
+            MidiEvent::NoteOn { channel, key, velocity } => note_acc.note_on(key, velocity, channel),
+            MidiEvent::NoteOff { channel, key, .. } => note_acc.note_off(key, channel),
             MidiEvent::ControlChange {
                 channel,
                 controller,
@@ -1147,7 +1163,7 @@ pub struct StreamingNoteLoader {
     parsed_until: u32,
 
     // State tracking
-    active_notes: Vec<[Option<ActiveNote>; 256]>,
+    active_notes: Vec<[[Option<ActiveNote>; 256]; 16]>,
 
     // Finished notes cache with bounds
     finished_notes: VecDeque<PackedNote>,
@@ -1239,7 +1255,7 @@ impl StreamingNoteLoader {
             cursors,
             heap,
             parsed_until: 0,
-            active_notes: vec![[None; 256]; num_tracks],
+            active_notes: vec![[[None; 256]; 16]; num_tracks],
             finished_notes: VecDeque::new(),
             max_finished_notes: 32_768,
             frame_notes: Vec::with_capacity(2048),
@@ -1327,26 +1343,32 @@ impl StreamingNoteLoader {
 
         // Add active notes (bounded)
         let provisional_end = parse_target as f32;
-        for (track_idx, track_notes) in self.active_notes.iter().enumerate() {
+        for (track_idx, track_channels) in self.active_notes.iter().enumerate() {
             if self.frame_notes.len() >= MAX_FRAME_NOTES {
                 break;
             }
-            for (key, active) in track_notes.iter().enumerate() {
+            for (ch, track_notes) in track_channels.iter().enumerate() {
                 if self.frame_notes.len() >= MAX_FRAME_NOTES {
                     break;
                 }
-                if let Some(note) = active {
-                    let start = note.start_tick as f32;
-                    if start > screen_end + ticks_per_screen {
-                        continue;
+                for (key, active) in track_notes.iter().enumerate() {
+                    if self.frame_notes.len() >= MAX_FRAME_NOTES {
+                        break;
                     }
-                    self.frame_notes.push(PackedNote::new(
-                        note.start_tick,
-                        provisional_end as u32,
-                        key as u8,
-                        note.velocity,
-                        track_idx as u16,
-                    ));
+                    if let Some(note) = active {
+                        let start = note.start_tick as f32;
+                        if start > screen_end + ticks_per_screen {
+                            continue;
+                        }
+                        self.frame_notes.push(PackedNote::new(
+                            note.start_tick,
+                            provisional_end as u32,
+                            key as u8,
+                            note.velocity,
+                            ch as u8,
+                            track_idx as u16,
+                        ));
+                    }
                 }
             }
         }
@@ -1398,25 +1420,27 @@ impl StreamingNoteLoader {
 
     fn process_event(&mut self, tick: u32, track_idx: usize, event: MidiEvent<'_>) {
         match event {
-            MidiEvent::NoteOn { key, velocity, .. } => {
+            MidiEvent::NoteOn { channel, key, velocity } => {
+                let ch = (channel.min(15)) as usize;
                 let key_idx = key as usize;
                 if key_idx < 256 && track_idx < self.active_notes.len() {
-                    if let Some(active) = self.active_notes[track_idx][key_idx].take() {
-                        self.finish_note(track_idx, key_idx, active, tick);
+                    if let Some(active) = self.active_notes[track_idx][ch][key_idx].take() {
+                        self.finish_note(track_idx, ch, key_idx, active, tick, channel);
                     }
                     if velocity > 0 {
-                        self.active_notes[track_idx][key_idx] = Some(ActiveNote {
+                        self.active_notes[track_idx][ch][key_idx] = Some(ActiveNote {
                             start_tick: tick,
                             velocity,
                         });
                     }
                 }
             }
-            MidiEvent::NoteOff { key, .. } => {
+            MidiEvent::NoteOff { channel, key, .. } => {
+                let ch = (channel.min(15)) as usize;
                 let key_idx = key as usize;
                 if key_idx < 256 && track_idx < self.active_notes.len() {
-                    if let Some(active) = self.active_notes[track_idx][key_idx].take() {
-                        self.finish_note(track_idx, key_idx, active, tick);
+                    if let Some(active) = self.active_notes[track_idx][ch][key_idx].take() {
+                        self.finish_note(track_idx, ch, key_idx, active, tick, channel);
                     }
                 }
             }
@@ -1424,12 +1448,13 @@ impl StreamingNoteLoader {
         }
     }
 
-    fn finish_note(&mut self, track_idx: usize, key: usize, active: ActiveNote, end_tick: u32) {
+    fn finish_note(&mut self, track_idx: usize, ch: usize, key: usize, active: ActiveNote, end_tick: u32, channel: u8) {
         self.finished_notes.push_back(PackedNote::new(
             active.start_tick,
             end_tick,
             key as u8,
             active.velocity,
+            channel,
             track_idx as u16,
         ));
 
@@ -1767,35 +1792,37 @@ mod tests {
 
     #[test]
     fn test_packed_note_size() {
-        // Verify the packed size is 12 bytes
-        assert_eq!(core::mem::size_of::<PackedNote>(), 12);
+        // Verify the packed size is 13 bytes (was 12 before adding channel)
+        assert_eq!(core::mem::size_of::<PackedNote>(), 13);
     }
 
     #[test]
     fn test_packed_note_new() {
-        let note = PackedNote::new(100, 200, 60, 100, 0);
+        let note = PackedNote::new(100, 200, 60, 100, 5, 0);
         // Copy fields to avoid unaligned reference issues with packed struct
         let start_tick = note.start_tick;
         let end_tick = note.end_tick;
         let key = note.key;
         let velocity = note.velocity;
+        let channel = note.channel;
         let track = note.track;
         assert_eq!(start_tick, 100);
         assert_eq!(end_tick, 200);
         assert_eq!(key, 60);
         assert_eq!(velocity, 100);
+        assert_eq!(channel, 5);
         assert_eq!(track, 0);
     }
 
     #[test]
     fn test_packed_note_duration() {
-        let note = PackedNote::new(100, 250, 60, 100, 0);
+        let note = PackedNote::new(100, 250, 60, 100, 0, 0);
         assert_eq!(note.duration(), 150);
     }
 
     #[test]
     fn test_packed_note_overlaps() {
-        let note = PackedNote::new(100, 200, 60, 100, 0);
+        let note = PackedNote::new(100, 200, 60, 100, 0, 0);
 
         // Overlapping ranges
         assert!(note.overlaps(50.0, 150.0));
@@ -1811,9 +1838,9 @@ mod tests {
     #[test]
     fn test_note_index_build() {
         let notes = vec![
-            PackedNote::new(0, 100, 60, 100, 0),
-            PackedNote::new(50, 150, 64, 100, 0),
-            PackedNote::new(200, 300, 67, 100, 1),
+            PackedNote::new(0, 100, 60, 100, 0, 0),
+            PackedNote::new(50, 150, 64, 100, 0, 0),
+            PackedNote::new(200, 300, 67, 100, 0, 1),
         ];
 
         let index = NoteIndex::build(notes, 100);
@@ -1826,10 +1853,10 @@ mod tests {
     #[test]
     fn test_note_index_query_range() {
         let notes = vec![
-            PackedNote::new(0, 100, 60, 100, 0),
-            PackedNote::new(50, 150, 64, 100, 0),
-            PackedNote::new(200, 300, 67, 100, 1),
-            PackedNote::new(400, 500, 72, 100, 0),
+            PackedNote::new(0, 100, 60, 100, 0, 0),
+            PackedNote::new(50, 150, 64, 100, 0, 0),
+            PackedNote::new(200, 300, 67, 100, 0, 1),
+            PackedNote::new(400, 500, 72, 100, 0, 0),
         ];
 
         let index = NoteIndex::build(notes, 100);
@@ -1899,11 +1926,13 @@ mod tests {
         let end_tick = notes[0].end_tick;
         let key = notes[0].key;
         let velocity = notes[0].velocity;
+        let channel = notes[0].channel;
         let track = notes[0].track;
         assert_eq!(start_tick, 0);
         assert_eq!(end_tick, 480);
         assert_eq!(key, 60);
         assert_eq!(velocity, 100);
+        assert_eq!(channel, 0);
         assert_eq!(track, 0);
 
         // Should have default tempo

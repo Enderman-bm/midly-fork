@@ -18,12 +18,12 @@ use crate::riff;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MidiEvent<'a> {
     NoteOn {
-        _channel: u8,
+        channel: u8,
         key: u8,
         velocity: u8,
     },
     NoteOff {
-        _channel: u8,
+        channel: u8,
         key: u8,
         _velocity: u8,
     },
@@ -104,7 +104,7 @@ impl<'a> TrackIter<'a> {
                 };
                 self.offset = self.offset.saturating_add(2);
                 MidiEvent::NoteOff {
-                    _channel: status & 0x0F,
+                    channel: status & 0x0F,
                     key,
                     _velocity: vel,
                 }
@@ -126,13 +126,13 @@ impl<'a> TrackIter<'a> {
                 self.offset = self.offset.saturating_add(2);
                 if velocity == 0 {
                     MidiEvent::NoteOff {
-                        _channel: status & 0x0F,
+                        channel: status & 0x0F,
                         key,
                         _velocity: 0,
                     }
                 } else {
                     MidiEvent::NoteOn {
-                        _channel: status & 0x0F,
+                        channel: status & 0x0F,
                         key,
                         velocity,
                     }
