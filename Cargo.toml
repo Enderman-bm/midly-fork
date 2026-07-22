@@ -1,21 +1,18 @@
 [package]
-name = "midly"
+name = "lumino-midly"
 version = "0.6.0"
 edition = "2024"
 authors = ["negamartin"]
-include = [
-  "/src/*",
-  "/Cargo.toml",
-]
-
-[workspace]
-members = ["benchmark", "collectinfo", "midly-bm-OR"]
 description = "Fast MIDI decoder and encoder both for .mid files and real-time MIDI events"
-repository = "https://github.com/Enderman-bm/midly-fork"
+repository = "https://github.com/PenguinBMDevs/midly-fork"
 readme = "README.md"
 keywords = ["midi", "no_std", "audio", "parser"]
 categories = ["multimedia::audio", "multimedia::encoding", "multimedia"]
 license = "Unlicense"
+include = [
+  "/src/*",
+  "/Cargo.toml",
+]
 
 [features]
 default = ["alloc", "std", "parallel"]
