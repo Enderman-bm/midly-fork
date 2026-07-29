@@ -44,6 +44,9 @@ pub(crate) enum MidiEvent<'a> {
         event_type: u8,
         data: &'a [u8],
     },
+    SysEx {
+        data: &'a [u8],
+    },
     Other,
 }
 
@@ -153,8 +156,9 @@ impl<'a> TrackIter<'a> {
                 } else if status == 0xF0 || status == 0xF7 {
                     let len = self.read_vlq() as usize;
                     let end = (self.offset + len).min(self.data.len());
+                    let data = &self.data[self.offset..end];
                     self.offset = end;
-                    MidiEvent::Other
+                    MidiEvent::SysEx { data }
                 } else {
                     MidiEvent::Other
                 }

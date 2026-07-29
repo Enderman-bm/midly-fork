@@ -186,6 +186,79 @@ impl PackedTimeSignatureEvent {
     }
 }
 
+/// A compact, packed representation of a MIDI key signature meta event.
+///
+/// Uses **6 bytes** to store key signature events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(C, packed)]
+pub struct PackedKeySignatureEvent {
+    /// Event time in MIDI ticks (4 bytes)
+    pub tick: u32,
+    /// Number of sharps (positive) or flats (negative), range -7..=7 (1 byte signed)
+    pub sharps: i8,
+    /// True if minor, false if major (1 byte)
+    pub is_minor: bool,
+}
+
+impl PackedKeySignatureEvent {
+    /// Create a new packed key signature event.
+    #[inline]
+    pub fn new(tick: u32, sharps: i8, is_minor: bool) -> Self {
+        Self {
+            tick,
+            sharps,
+            is_minor,
+        }
+    }
+}
+
+/// A lightweight borrowed text meta event (lyric / marker / text / track name / ...).
+///
+/// The text payload is **borrowed** from the original MIDI byte slice to avoid copies
+/// during the parse pass. Callers that need to persist the data must copy it out in
+/// the callback. This keeps the 100 GB MIDI path from allocating gigabytes of text
+/// unless the consumer explicitly asks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PackedTextEvent<'a> {
+    /// Event time in MIDI ticks
+    pub tick: u32,
+    /// Track index
+    pub track: u16,
+    /// Raw text payload (encoding depends on the source file)
+    pub text: &'a [u8],
+}
+
+impl<'a> PackedTextEvent<'a> {
+    /// Create a new borrowed text event.
+    #[inline]
+    pub fn new(tick: u32, track: u16, text: &'a [u8]) -> Self {
+        Self { tick, track, text }
+    }
+}
+
+/// A lightweight borrowed System Exclusive event.
+///
+/// The data payload is **borrowed** from the original MIDI byte slice. SysEx events can
+/// be large, so this is critical for the 100 GB MIDI path: the caller decides whether to
+/// copy, stream to disk, or ignore the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PackedSysExEvent<'a> {
+    /// Event time in MIDI ticks
+    pub tick: u32,
+    /// Track index
+    pub track: u16,
+    /// Raw SysEx payload (does not include the 0xF0 prefix)
+    pub data: &'a [u8],
+}
+
+impl<'a> PackedSysExEvent<'a> {
+    /// Create a new borrowed SysEx event.
+    #[inline]
+    pub fn new(tick: u32, track: u16, data: &'a [u8]) -> Self {
+        Self { tick, track, data }
+    }
+}
+
 impl PackedNote {
     /// Create a new packed note.
     #[inline]
@@ -1028,6 +1101,161 @@ where
     }
 
     Ok(())
+}
+
+/// All events extracted from a single track, using borrowed slices for text/SysEx data.
+///
+/// This is the most complete extraction interface in `midly`. It passes **borrowed**
+/// byte slices for lyrics, markers and SysEx so that a 100 GB MIDI file with large
+/// SysEx payloads does not force midly to allocate. The consumer copies only what it
+/// needs to persist.
+#[cfg(feature = "alloc")]
+#[derive(Clone, Debug)]
+pub struct TrackAllEvents<'a> {
+    /// Notes found in this track, sorted by start tick.
+    pub notes: Vec<PackedNote>,
+    /// Tempo changes found in this track.
+    pub tempo_changes: Vec<(u32, f32)>,
+    /// Time signatures found in this track.
+    pub time_signatures: Vec<PackedTimeSignatureEvent>,
+    /// Key signatures found in this track.
+    pub key_signatures: Vec<PackedKeySignatureEvent>,
+    /// Control / program / pitch-bend events found in this track.
+    pub control_events: Vec<PackedControlEvent>,
+    /// Lyric meta events (type 0x05), borrowed from the original byte slice.
+    pub lyrics: Vec<PackedTextEvent<'a>>,
+    /// Marker meta events (type 0x06), borrowed from the original byte slice.
+    pub markers: Vec<PackedTextEvent<'a>>,
+    /// System Exclusive events (0xF0 / 0xF7), borrowed from the original byte slice.
+    pub sys_ex: Vec<PackedSysExEvent<'a>>,
+}
+
+/// 直接从 MIDI 字节流按轨提取全部事件（音符 + 速度 + 拍号 + 调号 + 控制事件 +
+/// 歌词 + 标记 + SysEx），通过回调逐轨处理。
+///
+/// 与只提取部分事件的函数不同，该版本把所有 meta 文本/SysEx 以 **借用切片** 形式
+/// 交给回调：调用方决定复制、丢弃或写入磁盘。对 100 GB 极端 MIDI 文件，避免在
+/// 解析器内部无差别分配大块 SysEx 内存。
+///
+/// 该版本使用 `rayon` 并行解析各轨，并通过 `Mutex` 保护回调。调用方应通过
+/// `track_idx` 自行写入对应槽位，不依赖回调顺序。
+#[cfg(feature = "alloc")]
+pub fn extract_all_events_per_track_streaming_from_bytes<F>(
+    bytes: &[u8],
+    track_handler: F,
+) -> crate::Result<()>
+where
+    F: for<'a> FnMut(usize, TrackAllEvents<'a>) + Send,
+{
+    let data = crate::ump::preprocess_smf(bytes);
+    let (_header, tracks_count, _division, raw) = fast_midi::parse_header(&data)?;
+    let tracks = fast_midi::iter_tracks_from_data(raw, tracks_count);
+
+    let handler = std::sync::Mutex::new(track_handler);
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        tracks.into_par_iter().enumerate().for_each(|(track_idx, events)| {
+            let events = parse_fast_track_all_events(events, track_idx as u16);
+            let mut h = handler.lock().unwrap_or_else(|e| e.into_inner());
+            h(track_idx, events);
+        });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut handler = track_handler;
+        for (track_idx, events) in tracks.into_iter().enumerate() {
+            let events = parse_fast_track_all_events(events, track_idx as u16);
+            handler(track_idx, events);
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse all events (notes, tempo, signatures, controls, lyrics, markers, SysEx)
+/// without allocating intermediate `TrackEvent` structs. Text/SysEx payloads are borrowed
+/// from the raw track slice to keep the 100 GB path allocation-free in the parser.
+#[cfg(feature = "alloc")]
+fn parse_fast_track_all_events(
+    mut events: FastTrackIter,
+    track_idx: u16,
+) -> TrackAllEvents<'_> {
+    let mut note_acc = NoteAccumulator::new(track_idx);
+    let mut ctrl_acc = ControlEventAccumulator::new(track_idx);
+    let mut time_signatures = Vec::new();
+    let mut key_signatures = Vec::new();
+    let mut lyrics = Vec::new();
+    let mut markers = Vec::new();
+    let mut sys_ex = Vec::new();
+
+    while let Some((delta, event)) = events.next_event() {
+        note_acc.advance(delta);
+        ctrl_acc.advance(delta);
+
+        match event {
+            MidiEvent::NoteOn { channel, key, velocity } => {
+                note_acc.note_on(key, velocity, channel)
+            }
+            MidiEvent::NoteOff { channel, key, .. } => note_acc.note_off(key, channel),
+            MidiEvent::ControlChange {
+                channel,
+                controller,
+                value,
+            } => ctrl_acc.control_change(channel, controller, value),
+            MidiEvent::ProgramChange { channel, program } => {
+                ctrl_acc.program_change(channel, program)
+            }
+            MidiEvent::PitchBend { channel, bend } => ctrl_acc.pitch_bend(channel, bend),
+            MidiEvent::SysEx { data } => {
+                sys_ex.push(PackedSysExEvent::new(note_acc.current_tick, track_idx, data));
+            }
+            MidiEvent::Meta { event_type, data } => match event_type {
+                0x51 if data.len() == 3 => {
+                    let microseconds =
+                        ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
+                    note_acc.tempo_microseconds(microseconds);
+                }
+                0x58 if data.len() >= 2 => {
+                    time_signatures.push(PackedTimeSignatureEvent::new(
+                        note_acc.current_tick,
+                        data[0],
+                        data[1],
+                    ));
+                }
+                0x59 if data.len() >= 2 => {
+                    key_signatures.push(PackedKeySignatureEvent::new(
+                        note_acc.current_tick,
+                        data[0] as i8,
+                        data[1] != 0,
+                    ));
+                }
+                0x05 => {
+                    lyrics.push(PackedTextEvent::new(note_acc.current_tick, track_idx, data));
+                }
+                0x06 => {
+                    markers.push(PackedTextEvent::new(note_acc.current_tick, track_idx, data));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    let (notes, tempo_changes) = note_acc.finish();
+    let control_events = ctrl_acc.finish();
+
+    TrackAllEvents {
+        notes,
+        tempo_changes,
+        time_signatures,
+        key_signatures,
+        control_events,
+        lyrics,
+        markers,
+        sys_ex,
+    }
 }
 
 /// Parse events directly to notes without allocating intermediate TrackEvent structs.
@@ -2112,5 +2340,100 @@ mod tests {
         assert!(has_extended, "should contain keys > 127 in 256-key mode");
         let has_extended_fast = fast_keys.iter().any(|&k| k > 127);
         assert!(has_extended_fast, "fast path should contain keys > 127");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_extract_all_events_per_track_streaming() {
+        let track = vec![
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Meta(MetaMessage::Tempo(crate::primitive::u24::new(500_000))),
+            },
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Meta(MetaMessage::TimeSignature(4, 2, 24, 8)),
+            },
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Meta(MetaMessage::KeySignature(2, false)),
+            },
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::new(0),
+                    message: MidiMessage::NoteOn {
+                        key: 60,
+                        vel: u7::new(100),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::new(480),
+                kind: TrackEventKind::Meta(MetaMessage::Lyric(b"la")),
+            },
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Meta(MetaMessage::Marker(b"Chorus")),
+            },
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::SysEx(b"\x01\x02\x03\xF7"),
+            },
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::new(0),
+                    message: MidiMessage::NoteOff {
+                        key: 60,
+                        vel: u7::new(0),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+        let smf = crate::Smf {
+            header: crate::smf::Header {
+                format: Format::Parallel,
+                timing: Timing::Metrical(u15::new(480)),
+            },
+            tracks: vec![track],
+        };
+
+        let mut bytes = Vec::new();
+        smf.write(&mut bytes).expect("write failed");
+
+        // 回调内借用数据不可逃逸，因此把需要断言的数据复制到 owned 容器。
+        let mut note_keys = Vec::new();
+        let mut tempos = Vec::new();
+        let mut time_sigs = Vec::new();
+        let mut key_sigs = Vec::new();
+        let mut lyrics = Vec::new();
+        let mut markers = Vec::new();
+        let mut sys_exes = Vec::new();
+        extract_all_events_per_track_streaming_from_bytes(&bytes,
+            |_track_idx, events| {
+                note_keys.extend(events.notes.iter().map(|n| n.key));
+                tempos.extend(events.tempo_changes.iter().copied());
+                time_sigs.extend(events.time_signatures.iter().map(|e| (e.tick, e.numerator, e.denominator)));
+                key_sigs.extend(events.key_signatures.iter().map(|e| (e.tick, e.sharps, e.is_minor)));
+                lyrics.extend(events.lyrics.iter().map(|e| (e.tick, e.track, e.text.to_vec())));
+                markers.extend(events.markers.iter().map(|e| (e.tick, e.track, e.text.to_vec())));
+                sys_exes.extend(events.sys_ex.iter().map(|e| (e.tick, e.track, e.data.to_vec())));
+            },
+        )
+        .expect("extract all events failed");
+
+        assert_eq!(note_keys, vec![60]);
+        assert_eq!(tempos.len(), 1);
+        assert!((tempos[0].1 - 120.0).abs() < 0.001);
+        assert_eq!(time_sigs, vec![(0, 4, 2)]);
+        assert_eq!(key_sigs, vec![(0, 2, false)]);
+        assert_eq!(lyrics, vec![(480, 0, b"la".to_vec())]);
+        assert_eq!(markers, vec![(480, 0, b"Chorus".to_vec())]);
+        assert_eq!(sys_exes, vec![(480, 0, b"\x01\x02\x03\xF7".to_vec())]);
     }
 }
