@@ -158,6 +158,34 @@ impl PackedControlEvent {
     }
 }
 
+/// A compact, packed representation of a MIDI time signature meta event.
+///
+/// Uses **6 bytes** to store time signature events. The denominator is kept in its raw
+/// MIDI form (a power-of-two exponent), allowing callers to apply their own conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(C, packed)]
+pub struct PackedTimeSignatureEvent {
+    /// Event time in MIDI ticks (4 bytes)
+    pub tick: u32,
+    /// Time signature numerator (1 byte)
+    pub numerator: u8,
+    /// Time signature denominator as a power-of-two exponent (1 byte).
+    /// For example, a denominator of `2` means 1/4, `3` means 1/8.
+    pub denominator: u8,
+}
+
+impl PackedTimeSignatureEvent {
+    /// Create a new packed time signature event.
+    #[inline]
+    pub fn new(tick: u32, numerator: u8, denominator: u8) -> Self {
+        Self {
+            tick,
+            numerator,
+            denominator,
+        }
+    }
+}
+
 impl PackedNote {
     /// Create a new packed note.
     #[inline]
@@ -954,7 +982,7 @@ pub fn extract_notes_and_control_events_per_track_from_bytes(
     Ok(results)
 }
 
-/// 直接从 MIDI 字节流按轨提取音符与控制事件，通过回调逐轨处理。
+/// 直接从 MIDI 字节流按轨提取音符、控制事件与时间签名，通过回调逐轨处理。
 ///
 /// 与 [`extract_notes_and_control_events_per_track_from_bytes`] 不同，该函数不会
 /// 把所有音轨的 `Vec<PackedNote>` 同时保留在内存中；每解析完一轨就立即调用
@@ -963,13 +991,15 @@ pub fn extract_notes_and_control_events_per_track_from_bytes(
 /// 该版本使用 `rayon` 并行解析各轨，并通过 `Mutex` 保护回调，因此回调可能被
 /// 以任意顺序、多线程并发调用。调用方应通过 `track_idx` 自行写入对应槽位，
 /// 不依赖回调顺序。
+///
+/// 回调参数为 `(track_idx, notes, tempo_changes, control_events, time_signatures)`。
 #[cfg(feature = "alloc")]
 pub fn extract_notes_and_control_events_per_track_streaming_from_bytes<F>(
     bytes: &[u8],
     track_handler: F,
 ) -> crate::Result<()>
 where
-    F: FnMut(usize, Vec<PackedNote>, Vec<(u32, f32)>, Vec<PackedControlEvent>) + Send,
+    F: FnMut(usize, Vec<PackedNote>, Vec<(u32, f32)>, Vec<PackedControlEvent>, Vec<PackedTimeSignatureEvent>) + Send,
 {
     let data = crate::ump::preprocess_smf(bytes);
     let (_header, tracks_count, _division, raw) = fast_midi::parse_header(&data)?;
@@ -981,19 +1011,19 @@ where
     {
         use rayon::prelude::*;
         tracks.into_par_iter().enumerate().for_each(|(track_idx, events)| {
-            let (notes, tempo_changes, control_events) =
-                parse_fast_track_notes_and_control_events(events, track_idx as u16);
+            let (notes, tempo_changes, control_events, time_signatures) =
+                parse_fast_track_notes_control_and_time_signature_events(events, track_idx as u16);
             let mut h = handler.lock().unwrap_or_else(|e| e.into_inner());
-            h(track_idx, notes, tempo_changes, control_events);
+            h(track_idx, notes, tempo_changes, control_events, time_signatures);
         });
     }
     #[cfg(not(feature = "parallel"))]
     {
         let mut handler = track_handler;
         for (track_idx, events) in tracks.into_iter().enumerate() {
-            let (notes, tempo_changes, control_events) =
-                parse_fast_track_notes_and_control_events(events, track_idx as u16);
-            handler(track_idx, notes, tempo_changes, control_events);
+            let (notes, tempo_changes, control_events, time_signatures) =
+                parse_fast_track_notes_control_and_time_signature_events(events, track_idx as u16);
+            handler(track_idx, notes, tempo_changes, control_events, time_signatures);
         }
     }
 
@@ -1073,6 +1103,69 @@ fn parse_fast_track_notes_and_control_events(
     let (notes, tempo_changes) = note_acc.finish();
     let control_events = ctrl_acc.finish();
     (notes, tempo_changes, control_events)
+}
+
+/// Parse events to notes AND control events (CC / PC / PB) AND time signature events
+/// without allocating intermediate TrackEvent structs.
+#[cfg(feature = "alloc")]
+fn parse_fast_track_notes_control_and_time_signature_events(
+    mut events: FastTrackIter,
+    track_idx: u16,
+) -> (
+    Vec<PackedNote>,
+    Vec<(u32, f32)>,
+    Vec<PackedControlEvent>,
+    Vec<PackedTimeSignatureEvent>,
+) {
+    let mut note_acc = NoteAccumulator::new(track_idx);
+    let mut ctrl_acc = ControlEventAccumulator::new(track_idx);
+    let mut time_signatures = Vec::new();
+
+    while let Some((delta, event)) = events.next_event() {
+        note_acc.advance(delta);
+        ctrl_acc.advance(delta);
+
+        match event {
+            MidiEvent::NoteOn { channel, key, velocity } => note_acc.note_on(key, velocity, channel),
+            MidiEvent::NoteOff { channel, key, .. } => note_acc.note_off(key, channel),
+            MidiEvent::ControlChange {
+                channel,
+                controller,
+                value,
+            } => ctrl_acc.control_change(channel, controller, value),
+            MidiEvent::ProgramChange { channel, program } => {
+                ctrl_acc.program_change(channel, program)
+            }
+            MidiEvent::PitchBend { channel, bend } => ctrl_acc.pitch_bend(channel, bend),
+            MidiEvent::Meta {
+                event_type: 0x51,
+                data,
+            } => {
+                if data.len() == 3 {
+                    let microseconds =
+                        ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
+                    note_acc.tempo_microseconds(microseconds);
+                }
+            }
+            MidiEvent::Meta {
+                event_type: 0x58,
+                data,
+            } => {
+                if data.len() >= 2 {
+                    time_signatures.push(PackedTimeSignatureEvent::new(
+                        note_acc.current_tick,
+                        data[0],
+                        data[1],
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (notes, tempo_changes) = note_acc.finish();
+    let control_events = ctrl_acc.finish();
+    (notes, tempo_changes, control_events, time_signatures)
 }
 
 // ============================================================================
